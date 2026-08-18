@@ -20,7 +20,7 @@ Acks the webhook immediately (202) and analyses in a background thread so HyperD
 
 ## Build
 Image is built + pushed by CI (`.github/workflows/release.yaml`) to
-`ghcr.io/braghettos/krateo-alert-troubleshooter` on push to `main` / tags. No local docker push.
+`ghcr.io/krateo-agentiko/alert-troubleshooter` on push to `main` / tags. No local docker push.
 
 ## Deploy
 ```sh

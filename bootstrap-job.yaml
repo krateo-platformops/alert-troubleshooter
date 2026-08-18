@@ -23,7 +23,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: bootstrap
-          image: ghcr.io/braghettos/krateo-alert-troubleshooter:latest
+          image: ghcr.io/krateo-agentiko/alert-troubleshooter:latest
           imagePullPolicy: Always
           command: ["python", "bootstrap.py"]
           env:

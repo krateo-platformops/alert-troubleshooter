@@ -1,7 +1,7 @@
 # krateo-alert-troubleshooter — the HyperDX-alert → Autopilot-analysis handler. HyperDX posts a
 # fired alert to http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook; the handler
 # calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image is a placeholder
-# (ghcr.io/braghettos/krateo-alert-troubleshooter:dev) — swap for the pushed tag.
+# (ghcr.io/krateo-agentiko/alert-troubleshooter:dev) — swap for the pushed tag.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -57,7 +57,7 @@ spec:
       serviceAccountName: krateo-alert-troubleshooter
       containers:
         - name: handler
-          image: ghcr.io/braghettos/krateo-alert-troubleshooter:v0.2.15
+          image: ghcr.io/krateo-agentiko/alert-troubleshooter:v0.2.15
           ports:
             - containerPort: 8080
           env:
