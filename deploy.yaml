@@ -1,11 +1,9 @@
 # krateo-alert-troubleshooter — the HyperDX-alert → Autopilot-analysis handler. HyperDX posts a
 # fired alert to http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook; the handler
-# calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image pinned to :v0.2.15
-# was never published under this org/repo name (that tag only ever existed under the pre-transfer
-# ghcr.io/braghettos/krateo-alert-troubleshooter) — ghcr.io/krateo-agentiko/alert-troubleshooter
-# currently only has :latest and :sha-<short> tags. Using :latest here so this bench deployment
-# also picks up the multi-arch (amd64+arm64) build once the release workflow's arm64 fix lands on
-# main; re-pin to the resulting :sha-<short> for a reproducible, immutable reference afterward.
+# calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image pinned to the
+# multi-arch (linux/amd64 + linux/arm64) build published from main@a0bfebf — verified with
+# `docker buildx imagetools inspect`. Bump this sha alongside any future handler.py/hyperdx*.py
+# change that needs to reach the cluster.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -61,7 +59,7 @@ spec:
       serviceAccountName: krateo-alert-troubleshooter
       containers:
         - name: handler
-          image: ghcr.io/krateo-agentiko/alert-troubleshooter:latest
+          image: ghcr.io/krateo-agentiko/alert-troubleshooter:sha-a0bfebf
           ports:
             - containerPort: 8080
           env:
