@@ -20,6 +20,18 @@
           "description": "Container image tag. Empty defaults to the chart appVersion (= the release tag), so chart and image move together."
         }
       }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "autopilotA2aUrl": {
+          "type": "string",
+          "title": "Autopilot A2A URL",
+          "description": "A2A endpoint of the krateo-autopilot agent the webhook calls for root-cause analysis. Defaults to the in-cluster kagent A2A Service `http://autopilot.krateo-system.svc:8080/` (kagent names the Service after the `autopilot` Agent, not `krateo-autopilot`).",
+          "default": "http://autopilot.krateo-system.svc:8080/"
+        }
+      }
     }
   }
 }
