@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "Alert Troubleshooter",
+  "description": "Bridges a HyperDX observability alert to a krateo-autopilot root-cause analysis, written back as a TroubleshootingReport CR the portal renders.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "title": "Image repository",
+          "default": "ghcr.io/krateo-platformops/alert-troubleshooter"
+        },
+        "tag": {
+          "type": "string",
+          "title": "Image tag",
+          "description": "Container image tag. Empty defaults to the chart appVersion (= the release tag), so chart and image move together."
+        }
+      }
+    }
+  }
+}
