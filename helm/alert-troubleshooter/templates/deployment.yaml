@@ -68,22 +68,25 @@ spec:
           ports:
             - containerPort: 8080
           env:
+            # All runtime config is overridable via values.config.* (installer:
+            # componentValues.alert-troubleshooter.config.*); defaults live in values.yaml and match the
+            # in-cluster krateo-system layout. NAMESPACE is the release namespace (where reports are created).
             - name: NAMESPACE
-              value: krateo-system
+              value: {{ .Release.Namespace | quote }}
             - name: AUTOPILOT_A2A_URL
-              value: {{ .Values.config.autopilotA2aUrl | default "http://autopilot.krateo-system.svc:8080/" | quote }}
+              value: {{ .Values.config.autopilotA2aUrl | quote }}
             - name: REPORT_COOLDOWN
-              value: "1800"     # dedup window (s): don't re-analyze the same alert within this
+              value: {{ .Values.config.reportCooldown | quote }}     # dedup window (s): don't re-analyze the same alert within this
             # --- reconciler (Alert CRs -> HyperDX v2 external API, Bearer auth) ---
             - name: HYPERDX_API_URL
-              value: http://krateo-clickstack-api.krateo-system.svc:8000
+              value: {{ .Values.config.hyperdxApiUrl | quote }}
             - name: HYPERDX_ACCESS_KEY
               valueFrom: { secretKeyRef: { name: hyperdx-api-token, key: accessKey } }
             - name: RECONCILE_INTERVAL
-              value: "60"
+              value: {{ .Values.config.reconcileInterval | quote }}
             # default Alert CRs seeded by the reconciler (not shipped as CRs — CRD-order safe)
             - name: DEFAULT_ALERTS_JSON
-              value: '[{"name":"error-log-volume","displayName":"Error log volume","where":"SeverityText:error OR SeverityText:Error OR SeverityText:ERROR","interval":"5m","threshold":1,"thresholdType":"above","message":"Error-log volume is elevated — Autopilot will auto-triage the root cause."},{"name":"warning-log-volume","displayName":"Warning log volume","where":"SeverityText:warn OR SeverityText:warning OR SeverityText:WARN","interval":"15m","threshold":25,"thresholdType":"above","message":"Warning-log volume crossed the threshold — Autopilot will summarise likely causes."}]'
+              value: {{ .Values.config.defaultAlerts | toJson | quote }}
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 3
