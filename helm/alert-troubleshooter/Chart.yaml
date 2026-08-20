@@ -4,4 +4,5 @@ description: Bridges a HyperDX observability alert to a krateo-autopilot root-ca
 type: application
 version: CHART_VERSION
 appVersion: "CHART_VERSION"
+icon: https://raw.githubusercontent.com/krateo-platformops/.github/main/brand/logo.svg
 keywords: [krateo, observability, alerts, autopilot]
