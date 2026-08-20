@@ -3,3 +3,10 @@
 image:
   repository: ghcr.io/krateo-platformops/alert-troubleshooter
   tag: ""
+
+config:
+  # A2A endpoint of the krateo-autopilot agent the webhook calls for root-cause analysis.
+  # Default = the in-cluster kagent A2A Service, which kagent names after the Agent's
+  # metadata.name — that agent is `autopilot`, NOT `krateo-autopilot`, so the Service is
+  # `autopilot.<namespace>.svc:8080`. Override only for a non-default agent name/namespace.
+  autopilotA2aUrl: http://autopilot.krateo-system.svc:8080/
