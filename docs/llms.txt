@@ -1,0 +1,12 @@
+# alert-troubleshooter
+Observability plumbing (krateo-platformops): a HyperDX alert webhook -> krateo-autopilot A2A
+root-cause analysis -> TroubleshootingReport CR (observability.krateo.io/v1alpha1) the portal
+renders. It calls an agent; it is not one.
+
+docs/overview.md: architecture
+docs/usage.md: install + wire the webhook
+docs/configuration.md: image + runtime env
+docs/api.md: the two CRDs + HTTP surface
+docs/examples.md: runnable examples
+docs/release.md: bare-semver build/release
+helm/alert-troubleshooter/: the chart

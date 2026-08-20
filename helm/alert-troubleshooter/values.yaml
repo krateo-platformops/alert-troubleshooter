@@ -1,0 +1,5 @@
+# The controller image. tag defaults to the chart appVersion (= release tag), so chart and
+# image move together; override to pin.
+image:
+  repository: ghcr.io/krateo-platformops/alert-troubleshooter
+  tag: ""
