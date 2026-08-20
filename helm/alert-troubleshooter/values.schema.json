@@ -35,6 +35,42 @@
           "title": "Autopilot A2A URL",
           "description": "A2A endpoint of the krateo-autopilot agent the webhook calls for root-cause analysis. Defaults to the in-cluster kagent A2A Service `http://autopilot.krateo-system.svc:8080/` (kagent names the Service after the `autopilot` Agent, not `krateo-autopilot`).",
           "default": "http://autopilot.krateo-system.svc:8080/"
+        },
+        "hyperdxApiUrl": {
+          "type": "string",
+          "title": "HyperDX API URL",
+          "description": "HyperDX v2 external API the reconciler pushes Alert CRs to (Bearer auth). Defaults to the krateo-clickstack-api Service.",
+          "default": "http://krateo-clickstack-api.krateo-system.svc:8000"
+        },
+        "reportCooldown": {
+          "type": "integer",
+          "title": "Report cooldown (s)",
+          "description": "Dedup window in seconds: don't re-analyze the same alert within this.",
+          "default": 1800
+        },
+        "reconcileInterval": {
+          "type": "integer",
+          "title": "Reconcile interval (s)",
+          "description": "How often (seconds) the reconciler pushes Alert CRs to HyperDX.",
+          "default": 60
+        },
+        "defaultAlerts": {
+          "type": "array",
+          "title": "Default alerts",
+          "description": "Default Alert CRs the reconciler seeds into HyperDX (rendered to DEFAULT_ALERTS_JSON). Set to [] to seed none.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "name": { "type": "string" },
+              "displayName": { "type": "string" },
+              "where": { "type": "string" },
+              "interval": { "type": "string" },
+              "threshold": { "type": "number" },
+              "thresholdType": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
         }
       }
     }

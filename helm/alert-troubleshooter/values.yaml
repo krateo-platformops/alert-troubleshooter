@@ -10,3 +10,27 @@ config:
   # metadata.name — that agent is `autopilot`, NOT `krateo-autopilot`, so the Service is
   # `autopilot.<namespace>.svc:8080`. Override only for a non-default agent name/namespace.
   autopilotA2aUrl: http://autopilot.krateo-system.svc:8080/
+  # HyperDX v2 external API the reconciler pushes Alert CRs to (Bearer auth via hyperdx-api-token).
+  # Default = the krateo-clickstack-api Service the observability stack exposes.
+  hyperdxApiUrl: http://krateo-clickstack-api.krateo-system.svc:8000
+  # Dedup window (seconds): don't re-analyze the same alert within this.
+  reportCooldown: 1800
+  # How often (seconds) the reconciler pushes Alert CRs to HyperDX.
+  reconcileInterval: 60
+  # Default Alert CRs the reconciler seeds into HyperDX (rendered to DEFAULT_ALERTS_JSON). Replace to
+  # ship your own default alerts, or set to [] to seed none.
+  defaultAlerts:
+  - name: error-log-volume
+    displayName: Error log volume
+    where: "SeverityText:error OR SeverityText:Error OR SeverityText:ERROR"
+    interval: 5m
+    threshold: 1
+    thresholdType: above
+    message: "Error-log volume is elevated — Autopilot will auto-triage the root cause."
+  - name: warning-log-volume
+    displayName: Warning log volume
+    where: "SeverityText:warn OR SeverityText:warning OR SeverityText:WARN"
+    interval: 15m
+    threshold: 25
+    thresholdType: above
+    message: "Warning-log volume crossed the threshold — Autopilot will summarise likely causes."
