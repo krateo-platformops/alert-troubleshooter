@@ -1,6 +1,6 @@
 # krateo-alert-troubleshooter — the HyperDX-alert → Autopilot-analysis handler. HyperDX posts a
 # fired alert to http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook; the handler
-# calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image pinned to :v0.2.17,
+# calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image is tag-driven (values.image.tag = chart appVersion),
 # a real tag published (from main@a0bfebf) after the arm64 build fix — verified multi-arch
 # (linux/amd64 + linux/arm64) with `docker buildx imagetools inspect`. Bump this version tag
 # alongside any future handler.py/hyperdx*.py change that needs to reach the cluster.
@@ -57,9 +57,14 @@ spec:
       labels: { app: krateo-alert-troubleshooter }
     spec:
       serviceAccountName: krateo-alert-troubleshooter
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: tmp
+          emptyDir: {}
       containers:
         - name: handler
-          image: ghcr.io/krateo-agentiko/alert-troubleshooter:v0.2.17
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           ports:
             - containerPort: 8080
           env:
@@ -85,7 +90,15 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
+            readOnlyRootFilesystem: true          # KSV-0014
+            seccompProfile: { type: RuntimeDefault }  # KSV-0104
             capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp                       # only writable path a read-only-root app needs
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
 ---
 apiVersion: v1
 kind: Service

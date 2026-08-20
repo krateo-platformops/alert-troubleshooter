@@ -20,10 +20,12 @@ spec:
       labels: { app: hyperdx-key-bootstrap }
     spec:
       serviceAccountName: krateo-alert-troubleshooter
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
       restartPolicy: OnFailure
       containers:
         - name: bootstrap
-          image: ghcr.io/krateo-agentiko/alert-troubleshooter:latest
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
           imagePullPolicy: Always
           command: ["python", "bootstrap.py"]
           env:
@@ -40,4 +42,6 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            seccompProfile: { type: RuntimeDefault }
             capabilities: { drop: ["ALL"] }

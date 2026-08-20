@@ -1,0 +1,7 @@
+apiVersion: v2
+name: alert-troubleshooter
+description: Bridges a HyperDX observability alert to a krateo-autopilot root-cause analysis, written back as a TroubleshootingReport CR the portal renders.
+type: application
+version: CHART_VERSION
+appVersion: "CHART_VERSION"
+keywords: [krateo, observability, alerts, autopilot]
