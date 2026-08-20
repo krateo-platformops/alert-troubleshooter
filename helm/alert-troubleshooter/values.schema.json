@@ -7,8 +7,8 @@
   "properties": {
     "global": {
       "type": "object",
-      "additionalProperties": true,
-      "description": "Global values shared across charts. Helm/core-provider inject this reserved key at install time, so a top-level additionalProperties:false schema MUST declare it or the composition's chart-inspector validation fails ('additional properties global not allowed')."
+      "description": "Global values shared across charts. Helm/core-provider inject this reserved key at install time, so a top-level additionalProperties:false schema MUST declare it or the composition's chart-inspector validation fails ('additional properties global not allowed').",
+      "x-kubernetes-preserve-unknown-fields": true
     },
     "image": {
       "type": "object",
@@ -60,16 +60,30 @@
           "description": "Default Alert CRs the reconciler seeds into HyperDX (rendered to DEFAULT_ALERTS_JSON). Set to [] to seed none.",
           "items": {
             "type": "object",
-            "additionalProperties": true,
             "properties": {
-              "name": { "type": "string" },
-              "displayName": { "type": "string" },
-              "where": { "type": "string" },
-              "interval": { "type": "string" },
-              "threshold": { "type": "number" },
-              "thresholdType": { "type": "string" },
-              "message": { "type": "string" }
-            }
+              "name": {
+                "type": "string"
+              },
+              "displayName": {
+                "type": "string"
+              },
+              "where": {
+                "type": "string"
+              },
+              "interval": {
+                "type": "string"
+              },
+              "threshold": {
+                "type": "number"
+              },
+              "thresholdType": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "x-kubernetes-preserve-unknown-fields": true
           }
         }
       }
