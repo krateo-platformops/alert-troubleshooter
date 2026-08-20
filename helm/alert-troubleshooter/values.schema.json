@@ -5,6 +5,11 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "global": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Global values shared across charts. Helm/core-provider inject this reserved key at install time, so a top-level additionalProperties:false schema MUST declare it or the composition's chart-inspector validation fails ('additional properties global not allowed')."
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,
