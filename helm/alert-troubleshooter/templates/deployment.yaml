@@ -57,6 +57,11 @@ spec:
       labels: { app: krateo-alert-troubleshooter }
     spec:
       serviceAccountName: krateo-alert-troubleshooter
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: tmp
+          emptyDir: {}
       containers:
         - name: handler
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -85,7 +90,15 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             runAsNonRoot: true
+            readOnlyRootFilesystem: true          # KSV-0014
+            seccompProfile: { type: RuntimeDefault }  # KSV-0104
             capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp                       # only writable path a read-only-root app needs
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
 ---
 apiVersion: v1
 kind: Service

@@ -25,8 +25,6 @@ Image is built + pushed by CI (`.github/workflows/release.yaml`) to
 
 ## Deploy
 ```sh
-kubectl apply -f crd.troubleshootingreport.yaml   # the report CRD
-kubectl apply -f deploy.yaml                       # SA + RBAC + Deployment + Service
 ```
 Then point a HyperDX webhook at `http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook`
 and reference it as the `channel.webhookId` on your `Alert` CRs.
