@@ -7,8 +7,48 @@
   "properties": {
     "global": {
       "type": "object",
-      "description": "Global values shared across charts. Helm/core-provider inject this reserved key at install time, so a top-level additionalProperties:false schema MUST declare it or the composition's chart-inspector validation fails ('additional properties global not allowed').",
-      "x-kubernetes-preserve-unknown-fields": true
+      "title": "Global values (injected by the Krateo composition engine)",
+      "description": "Context keys the composition-dynamic-controller injects when this chart installs as a component (plumbing InjectGlobalValues), plus the helm-standard imageRegistry override.",
+      "additionalProperties": false,
+      "properties": {
+        "compositionName": {
+          "type": "string"
+        },
+        "compositionNamespace": {
+          "type": "string"
+        },
+        "compositionId": {
+          "type": "string"
+        },
+        "compositionApiVersion": {
+          "type": "string"
+        },
+        "compositionGroup": {
+          "type": "string"
+        },
+        "compositionKind": {
+          "type": "string"
+        },
+        "compositionResource": {
+          "type": "string"
+        },
+        "compositionInstalledVersion": {
+          "type": "string"
+        },
+        "gracefullyPaused": {
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "krateoNamespace": {
+          "type": "string"
+        },
+        "imageRegistry": {
+          "type": "string"
+        }
+      }
     },
     "image": {
       "type": "object",
@@ -83,7 +123,7 @@
                 "type": "string"
               }
             },
-            "x-kubernetes-preserve-unknown-fields": true
+            "additionalProperties": false
           }
         }
       }
