@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema",
   "title": "Alert Troubleshooter",
-  "description": "Bridges a HyperDX observability alert to a krateo-autopilot root-cause analysis, written back as a TroubleshootingReport CR the portal renders.",
+  "description": "Bridges a HyperDX observability alert to an incident-agent root-cause analysis, written back as a TroubleshootingReport CR the portal renders.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -72,9 +72,9 @@
       "properties": {
         "autopilotA2aUrl": {
           "type": "string",
-          "title": "Autopilot A2A URL",
-          "description": "A2A endpoint of the krateo-autopilot agent the webhook calls for root-cause analysis. Defaults to the in-cluster kagent A2A Service `http://autopilot.krateo-system.svc:8080/` (kagent names the Service after the `autopilot` Agent, not `krateo-autopilot`).",
-          "default": "http://autopilot.krateo-system.svc:8080/"
+          "title": "RCA agent A2A URL",
+          "description": "A2A endpoint of the agent the webhook calls for root-cause analysis. Defaults to the in-cluster kagent A2A Service `http://incident-agent.krateo-system.svc:8080/` (kagent names the Service after the Agent's metadata.name).",
+          "default": "http://incident-agent.krateo-system.svc:8080/"
         },
         "hyperdxApiUrl": {
           "type": "string",

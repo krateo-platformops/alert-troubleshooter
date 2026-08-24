@@ -118,7 +118,7 @@ class HyperDXV2:
             "threshold": threshold,
             "thresholdType": threshold_type,
             "channel": {"type": "webhook", "webhookId": webhook_id},
-            "message": message or f"{name} threshold crossed — Krateo Autopilot will auto-triage.",
+            "message": message or f"{name} threshold crossed — incident-agent will auto-triage.",
         }
         a = self._req("POST", "/api/v2/alerts", body)
         return {"id": a["id"], "state": a.get("state", "OK")}
