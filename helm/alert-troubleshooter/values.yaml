@@ -16,20 +16,55 @@ config:
   reportCooldown: 1800
   # How often (seconds) the reconciler pushes Alert CRs to HyperDX.
   reconcileInterval: 60
-  # Default Alert CRs the reconciler seeds into HyperDX (rendered to DEFAULT_ALERTS_JSON). Replace to
-  # ship your own default alerts, or set to [] to seed none.
+  # Default Alert CRs the reconciler seeds into HyperDX (rendered to DEFAULT_ALERTS_JSON). Set to []
+  # to seed none. Each firing auto-launches a full incident-agent RCA, so this default set is kept
+  # DELIBERATELY SMALL, PLATFORM-SCOPED and HIGH-THRESHOLD — the goal is a few high-signal alerts that
+  # never storm, not broad coverage (add your own via Alert CRs; see examples/alerts/).
+  #
+  # `where` is ClickHouse SQL over otel_logs (the reconciler pins whereLanguage=sql; DO NOT use Lucene
+  # or SeverityText — this pipeline leaves SeverityText empty). Every `where` is either scoped to the
+  # platform namespace (`${NAMESPACE}` is substituted with the release namespace at render time) or
+  # excludes the observability stack's own ServiceNames, so an alert never diagnoses the telemetry
+  # pipeline itself. Thresholds are >0 over 15m so transient/rollout blips don't page.
   defaultAlerts:
-  - name: error-log-volume
-    displayName: Error log volume
-    where: "SeverityText:error OR SeverityText:Error OR SeverityText:ERROR"
-    interval: 5m
-    threshold: 1
-    thresholdType: above
-    message: "Error-log volume is elevated — incident-agent will auto-triage the root cause."
-  - name: warning-log-volume
-    displayName: Warning log volume
-    where: "SeverityText:warn OR SeverityText:warning OR SeverityText:WARN"
+  # The flagship platform-health signal: Krateo control-plane compositions failing to reconcile
+  # (controller-runtime's "Reconciler error" log + the provider's CannotObserveExternalResource event),
+  # cluster-wide but excluding every service that carries or evaluates telemetry (else it matches
+  # HyperDX's own echo of this query and diagnoses itself).
+  - name: krateo-composition-reconcile-error
+    displayName: "Krateo — composition reconcile errors"
+    where: >-
+      (positionCaseInsensitive(Body, 'Reconciler error') > 0
+       OR JSONExtractString(Body, 'object', 'reason') = 'CannotObserveExternalResource')
+      AND ServiceName NOT IN ('krateo-observability', 'krateo-alert-troubleshooter',
+          'krateo-clickstack', 'krateo-clickstack-clickhouse-clickhouse', 'clickhouse-mcp-server',
+          'incident-agent', 'krateo-autopilot', 'kagent', 'repo-mcp-server')
     interval: 15m
-    threshold: 25
+    threshold: 2
     thresholdType: above
-    message: "Warning-log volume crossed the threshold — incident-agent will summarise likely causes."
+    message: "Compositions are failing to reconcile — incident-agent will identify which and why."
+  # Platform pods crash-looping (kubelet BackOff event, scoped to the platform namespace so a tenant
+  # workload's crashloop never auto-triggers an RCA). threshold 3/15m ignores a single rollout blip.
+  - name: krateo-platform-crashloop
+    displayName: "Krateo — platform pod crash-looping"
+    where: >-
+      ResourceAttributes['k8s.namespace.name'] = '${NAMESPACE}'
+      AND ResourceAttributes['telemetry.source'] = 'k8s-events'
+      AND JSONExtractString(Body, 'object', 'reason') = 'BackOff'
+      AND positionCaseInsensitive(JSONExtractString(Body, 'object', 'message'), 'restarting failed container') > 0
+    interval: 15m
+    threshold: 3
+    thresholdType: above
+    message: "A platform pod is crash-looping — incident-agent will triage the cause."
+  # Platform image-pull failures (bad/private image pin, registry auth) in the platform namespace.
+  - name: krateo-platform-image-pull-failure
+    displayName: "Krateo — platform image pull failing"
+    where: >-
+      ResourceAttributes['k8s.namespace.name'] = '${NAMESPACE}'
+      AND ResourceAttributes['telemetry.source'] = 'k8s-events'
+      AND JSONExtractString(Body, 'object', 'reason') = 'Failed'
+      AND positionCaseInsensitive(JSONExtractString(Body, 'object', 'message'), 'failed to pull image') > 0
+    interval: 15m
+    threshold: 2
+    thresholdType: above
+    message: "A platform pod cannot pull its image — incident-agent will triage the cause."

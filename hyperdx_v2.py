@@ -91,7 +91,14 @@ class HyperDXV2:
                 "sourceId": source_id,
                 "asRatio": False,
                 "fillNulls": True,
-                "select": [{"aggFn": "count", "where": where or ""}],
+                # whereLanguage:"sql" is load-bearing. HyperDX's external API maps a tile series'
+                # `whereLanguage` to the alert's `aggConditionLanguage`, DEFAULTING TO 'lucene' when
+                # omitted (packages/api/src/utils/externalApi.ts: `aggConditionLanguage: s.whereLanguage ?? 'lucene'`).
+                # Alert `spec.where` is ClickHouse SQL (ResourceAttributes[...], JSONExtractString(Body,...),
+                # ServiceName NOT IN (...)). Without this pin the SQL is parsed as Lucene → it becomes a
+                # full-text search for the words of the query itself (self-matching HyperDX's own echoed
+                # query) and the alert fires on a phantom. Pin it to sql so the filter is evaluated as written.
+                "select": [{"aggFn": "count", "where": where or "", "whereLanguage": "sql"}],
             },
         }
         d = self._req("POST", "/api/v2/dashboards", {"name": name, "tags": [], "tiles": [tile]})

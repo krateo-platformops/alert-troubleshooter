@@ -85,9 +85,11 @@ spec:
               valueFrom: { secretKeyRef: { name: hyperdx-api-token, key: accessKey } }
             - name: RECONCILE_INTERVAL
               value: {{ .Values.config.reconcileInterval | quote }}
-            # default Alert CRs seeded by the reconciler (not shipped as CRs — CRD-order safe)
+            # default Alert CRs seeded by the reconciler (not shipped as CRs — CRD-order safe).
+            # `${NAMESPACE}` in a default alert's SQL `where` is substituted with the release namespace
+            # here, so the platform-scoped defaults are portable across a non-default krateo namespace.
             - name: DEFAULT_ALERTS_JSON
-              value: {{ .Values.config.defaultAlerts | toJson | quote }}
+              value: {{ .Values.config.defaultAlerts | toJson | replace "${NAMESPACE}" .Release.Namespace | quote }}
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 3
