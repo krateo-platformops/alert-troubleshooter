@@ -5,11 +5,10 @@ image:
   tag: ""
 
 config:
-  # A2A endpoint of the krateo-autopilot agent the webhook calls for root-cause analysis.
-  # Default = the in-cluster kagent A2A Service, which kagent names after the Agent's
-  # metadata.name — that agent is `autopilot`, NOT `krateo-autopilot`, so the Service is
-  # `autopilot.<namespace>.svc:8080`. Override only for a non-default agent name/namespace.
-  autopilotA2aUrl: http://autopilot.krateo-system.svc:8080/
+  # A2A endpoint of the agent the webhook calls for root-cause analysis. Default = incident-agent
+  # (has the k8s/Helm/ClickHouse read tools an RCA needs; autopilot has neither). In-cluster kagent
+  # A2A Service, named after the Agent's metadata.name -> incident-agent.<namespace>.svc:8080.
+  autopilotA2aUrl: http://incident-agent.krateo-system.svc:8080/
   # HyperDX v2 external API the reconciler pushes Alert CRs to (Bearer auth via hyperdx-api-token).
   # Default = the krateo-clickstack-api Service the observability stack exposes.
   hyperdxApiUrl: http://krateo-clickstack-api.krateo-system.svc:8000
@@ -26,11 +25,11 @@ config:
     interval: 5m
     threshold: 1
     thresholdType: above
-    message: "Error-log volume is elevated — Autopilot will auto-triage the root cause."
+    message: "Error-log volume is elevated — incident-agent will auto-triage the root cause."
   - name: warning-log-volume
     displayName: Warning log volume
     where: "SeverityText:warn OR SeverityText:warning OR SeverityText:WARN"
     interval: 15m
     threshold: 25
     thresholdType: above
-    message: "Warning-log volume crossed the threshold — Autopilot will summarise likely causes."
+    message: "Warning-log volume crossed the threshold — incident-agent will summarise likely causes."

@@ -1,6 +1,7 @@
-# krateo-alert-troubleshooter — the HyperDX-alert → Autopilot-analysis handler. HyperDX posts a
+# krateo-alert-troubleshooter — the HyperDX-alert → RCA-analysis handler. HyperDX posts a
 # fired alert to http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook; the handler
-# calls the Autopilot A2A agent and writes a TroubleshootingReport CR. Image is tag-driven (values.image.tag = chart appVersion),
+# calls the RCA agent's A2A endpoint (config.autopilotA2aUrl, incident-agent by default) and
+# writes a TroubleshootingReport CR. Image is tag-driven (values.image.tag = chart appVersion),
 # a real tag published (from main@a0bfebf) after the arm64 build fix — verified multi-arch
 # (linux/amd64 + linux/arm64) with `docker buildx imagetools inspect`. Bump this version tag
 # alongside any future handler.py/hyperdx*.py change that needs to reach the cluster.
