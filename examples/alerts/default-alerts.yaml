@@ -1,0 +1,66 @@
+# The three alerts the chart seeds by default (config.defaultAlerts), as applyable Alert CRs for
+# reference / editing / GitOps. When seeded by the reconciler, `${NAMESPACE}` is substituted with the
+# release namespace; here it is shown as krateo-system. spec.where is ClickHouse SQL over otel_logs
+# (whereLanguage=sql); filter on Body/ResourceAttributes (SeverityText is empty on this pipeline);
+# scope every alert (namespace or a ServiceName self-exclusion) so it never diagnoses the telemetry
+# pipeline echoing its own query. thresholdType `above` is strictly-greater.
+apiVersion: observability.krateo.io/v1alpha1
+kind: Alert
+metadata:
+  name: krateo-composition-reconcile-error
+  namespace: krateo-system
+  labels:
+    app.kubernetes.io/managed-by: alert-troubleshooter
+    observability.krateo.io/default: "true"
+spec:
+  displayName: "Krateo — composition reconcile errors"
+  where: >-
+    (positionCaseInsensitive(Body, 'Reconciler error') > 0
+     OR JSONExtractString(Body, 'object', 'reason') = 'CannotObserveExternalResource')
+    AND ServiceName NOT IN ('krateo-observability', 'krateo-alert-troubleshooter',
+        'krateo-clickstack', 'krateo-clickstack-clickhouse-clickhouse', 'clickhouse-mcp-server',
+        'incident-agent', 'krateo-autopilot', 'kagent', 'repo-mcp-server')
+  interval: 15m
+  threshold: 2
+  thresholdType: above
+  message: "Compositions are failing to reconcile — incident-agent will identify which and why."
+---
+apiVersion: observability.krateo.io/v1alpha1
+kind: Alert
+metadata:
+  name: krateo-platform-crashloop
+  namespace: krateo-system
+  labels:
+    app.kubernetes.io/managed-by: alert-troubleshooter
+    observability.krateo.io/default: "true"
+spec:
+  displayName: "Krateo — platform pod crash-looping"
+  where: >-
+    ResourceAttributes['k8s.namespace.name'] = 'krateo-system'
+    AND ResourceAttributes['telemetry.source'] = 'k8s-events'
+    AND JSONExtractString(Body, 'object', 'reason') = 'BackOff'
+    AND positionCaseInsensitive(JSONExtractString(Body, 'object', 'message'), 'restarting failed container') > 0
+  interval: 15m
+  threshold: 3
+  thresholdType: above
+  message: "A platform pod is crash-looping — incident-agent will triage the cause."
+---
+apiVersion: observability.krateo.io/v1alpha1
+kind: Alert
+metadata:
+  name: krateo-platform-image-pull-failure
+  namespace: krateo-system
+  labels:
+    app.kubernetes.io/managed-by: alert-troubleshooter
+    observability.krateo.io/default: "true"
+spec:
+  displayName: "Krateo — platform image pull failing"
+  where: >-
+    ResourceAttributes['k8s.namespace.name'] = 'krateo-system'
+    AND ResourceAttributes['telemetry.source'] = 'k8s-events'
+    AND JSONExtractString(Body, 'object', 'reason') = 'Failed'
+    AND positionCaseInsensitive(JSONExtractString(Body, 'object', 'message'), 'failed to pull image') > 0
+  interval: 15m
+  threshold: 2
+  thresholdType: above
+  message: "A platform pod cannot pull its image — incident-agent will triage the cause."

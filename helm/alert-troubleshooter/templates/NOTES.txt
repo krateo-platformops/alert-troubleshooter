@@ -1,0 +1,21 @@
+alert-troubleshooter {{ .Chart.AppVersion }} installed in {{ .Release.Namespace }}.
+
+Default alerts seeded into HyperDX (config.defaultAlerts) — each firing auto-launches an
+incident-agent root-cause analysis:
+  - krateo-composition-reconcile-error   (control-plane reconcile failures)
+  - krateo-platform-crashloop            (platform pods crash-looping)
+  - krateo-platform-image-pull-failure   (platform image pull failures)
+
+Manage them as Alert CRs:
+  kubectl -n {{ .Release.Namespace }} get alerts
+
+UPGRADE NOTE (create-once reconciler): the reconciler never updates an Alert's HyperDX tile after it
+is first created. If you are upgrading from a version that seeded the old `error-log-volume` /
+`warning-log-volume` defaults — or you authored any Alert before this version — those carry a stale
+Lucene tile that never fires (this pipeline leaves SeverityText empty) and is NOT retrofitted by the
+new image. Delete them so a correct SQL tile is recreated:
+
+  kubectl -n {{ .Release.Namespace }} delete alert error-log-volume warning-log-volume --ignore-not-found
+
+Alert `spec.where` is ClickHouse SQL over otel_logs (whereLanguage is pinned to sql). See
+examples/alerts/ for the seeded defaults as CRs and the rules for writing your own.
