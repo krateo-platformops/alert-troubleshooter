@@ -16,12 +16,10 @@
 # steady-state reconciles are a no-op. (A pre-upgrade Helm hook would also work but can't be used here:
 # the Job runs as the krateo-alert-troubleshooter SA — a main-phase resource a pre-install hook would
 # race on a fresh install.)
-{{- $btag := .Values.image.tag | default .Chart.AppVersion | toString -}}
-{{- $bver := $btag | lower | replace "." "-" | replace "+" "-" | replace "_" "-" | trunc 40 | trimSuffix "-" -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hyperdx-key-bootstrap-{{ $bver }}
+  name: hyperdx-key-bootstrap-{{ .Values.image.tag | default .Chart.AppVersion | toString | lower | replace "." "-" | replace "+" "-" | replace "_" "-" | trunc 40 | trimSuffix "-" }}
   namespace: krateo-system
 spec:
   backoffLimit: 6            # HyperDX may still be booting when the installer fires this
