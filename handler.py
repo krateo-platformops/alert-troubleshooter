@@ -8,10 +8,12 @@ On POST /webhook (HyperDX alert-fired payload):
 
 Runs anyone's-browser-independent: this is the "background" path. Minimal deps: stdlib + requests.
 """
+import base64
 import json
 import os
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,7 +45,21 @@ REPORT_COOLDOWN = int(os.environ.get("REPORT_COOLDOWN", "1800"))
 # an order of magnitude under the limit, with ample headroom for a verbose run.
 CONTEXT_MAX_RUNS = max(1, int(os.environ.get("CONTEXT_MAX_RUNS", "10")))
 
+# Intra-service auth (Option A). The alert->RCA pipeline is autonomous — it carries NO user JWT —
+# but incident-agent's MCP tools sit behind agentgateway, whose authz allows /mcp only with a valid
+# Krateo JWT (`has(jwt.sub)`). So we mint a SERVICE identity: exchange this pod's projected
+# ServiceAccount token (audience "authn") at authn's /serviceaccount/login for a Krateo JWT, and
+# present it on the A2A call — incident-agent (KAGENT_PROPAGATE_TOKEN=true) then propagates it to the
+# gateway on the MCP tool calls. Fully OPT-IN and graceful: with no AUTHN_URL / no projected token
+# mounted (older clusters, no gateway) the exchange is skipped and the A2A call goes unauthenticated
+# exactly as before. Enable by setting AUTHN_URL and mounting an audience-"authn" projected token at
+# AUTHN_TOKEN_FILE (a serviceAccountToken projected volume, expirationSeconds ~600).
+AUTHN_URL = os.environ.get("AUTHN_URL", "").rstrip("/")
+AUTHN_TOKEN_FILE = os.environ.get("AUTHN_TOKEN_FILE", "/var/run/secrets/authn/token")
+
 _create_lock = threading.Lock()  # serialize the dedup-check + create so simultaneous fires don't race
+_jwt_cache = {"token": "", "exp": 0.0}
+_jwt_lock = threading.Lock()  # serialize the token exchange so concurrent fires reuse one JWT
 
 
 def _now():
@@ -53,6 +69,35 @@ def _now():
 def _sa_token():
     with open(f"{SA_DIR}/token") as f:
         return f.read().strip()
+
+
+def _service_jwt():
+    """Exchange this pod's projected SA token (audience "authn") for a Krateo JWT via authn's
+    `serviceaccount` login strategy; cache it until shortly before its own expiry. Returns "" when
+    the projected token / AUTHN_URL are absent OR the exchange fails — the A2A call then proceeds
+    unauthenticated, exactly as before (never break the RCA on an auth hiccup)."""
+    if not AUTHN_URL or not os.path.exists(AUTHN_TOKEN_FILE):
+        return ""
+    with _jwt_lock:
+        if _jwt_cache["token"] and time.time() < _jwt_cache["exp"] - 60:
+            return _jwt_cache["token"]
+        try:
+            with open(AUTHN_TOKEN_FILE) as f:
+                sa_tok = f.read().strip()
+            r = requests.post(f"{AUTHN_URL}/serviceaccount/login",
+                              headers={"Authorization": f"Bearer {sa_tok}"}, timeout=15)
+            r.raise_for_status()
+            jwt = (r.json() or {}).get("accessToken") or ""
+            if not jwt:
+                raise ValueError("authn response had no accessToken")
+            # Cache until the JWT's own `exp` (decode the base64url payload; pad to a multiple of 4).
+            seg = jwt.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+            _jwt_cache.update(token=jwt, exp=float(claims.get("exp") or (time.time() + 300)))
+            return jwt
+        except Exception as e:  # degrade to unauthenticated rather than failing the analysis
+            print(f"[authn] service-JWT exchange failed ({e}); calling A2A unauthenticated", flush=True)
+            return ""
 
 
 def _k8s(method, path, body=None, subresource=""):
@@ -223,8 +268,13 @@ def a2a_analyze(prompt, context_id=None):
         message["contextId"] = context_id
     body = {"id": 1, "jsonrpc": "2.0", "method": "message/stream", "params": {"message": message}}
     out = ""
+    headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+    # Present the service JWT so incident-agent can propagate it to its agentgateway-gated MCP tools.
+    jwt = _service_jwt()
+    if jwt:
+        headers["Authorization"] = f"Bearer {jwt}"
     with requests.post(AUTOPILOT_A2A, json=body, stream=True, timeout=A2A_TIMEOUT,
-                       headers={"Accept": "text/event-stream", "Content-Type": "application/json"}) as resp:
+                       headers=headers) as resp:
         resp.raise_for_status()
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw or not raw.startswith("data:"):
