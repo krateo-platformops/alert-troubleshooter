@@ -7,10 +7,21 @@
 # installer generates it, e.g.:
 #   kubectl create secret generic hyperdx-admin-creds -n krateo-system \
 #     --from-literal=email=admin@krateo.local --from-literal=password="$(openssl rand -hex 24)"
+#
+# The name is VERSION-SUFFIXED on purpose. A Job's spec.template is IMMUTABLE, so when the image tag
+# changes on a version bump the cdc's self-heal apply cannot patch a fixed-name Job
+# ("spec.template: field is immutable") and the whole composition wedges Ready=False. Suffixing the
+# name with the image tag makes each release a NEW Job (helm creates it and prunes the previous one),
+# so there is never an in-place patch of an immutable field. Within a release the name is stable, so
+# steady-state reconciles are a no-op. (A pre-upgrade Helm hook would also work but can't be used here:
+# the Job runs as the krateo-alert-troubleshooter SA — a main-phase resource a pre-install hook would
+# race on a fresh install.)
+{{- $btag := .Values.image.tag | default .Chart.AppVersion | toString -}}
+{{- $bver := $btag | lower | replace "." "-" | replace "+" "-" | replace "_" "-" | trunc 40 | trimSuffix "-" -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: hyperdx-key-bootstrap
+  name: hyperdx-key-bootstrap-{{ $bver }}
   namespace: krateo-system
 spec:
   backoffLimit: 6            # HyperDX may still be booting when the installer fires this
