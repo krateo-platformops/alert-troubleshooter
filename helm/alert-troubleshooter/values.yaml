@@ -9,6 +9,13 @@ config:
   # (has the k8s/Helm/ClickHouse read tools an RCA needs; autopilot has neither). In-cluster kagent
   # A2A Service, named after the Agent's metadata.name -> incident-agent.<namespace>.svc:8080.
   autopilotA2aUrl: http://incident-agent.krateo-system.svc:8080/
+  # Intra-service auth (Option A). Base URL of the authn service. When set, the handler exchanges its
+  # projected SA token (audience "authn") at <authnUrl>/serviceaccount/login for a Krateo JWT and
+  # presents it on the A2A call, so incident-agent can reach its agentgateway-gated MCP tools; a
+  # serviceaccount.authn.krateo.io ServiceAccount mapping CR is also rendered. Requires authn's
+  # serviceaccount strategy. Empty (default) DISABLES it — unauthenticated A2A, exactly as before
+  # (safe on older clusters with no gateway). Enable in-cluster with: http://authn.krateo-system.svc
+  authnUrl: ""
   # HyperDX v2 external API the reconciler pushes Alert CRs to (Bearer auth via hyperdx-api-token).
   # Default = the krateo-clickstack-api Service the observability stack exposes.
   hyperdxApiUrl: http://krateo-clickstack-api.krateo-system.svc:8000

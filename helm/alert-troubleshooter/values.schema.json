@@ -76,6 +76,12 @@
           "description": "A2A endpoint of the agent the webhook calls for root-cause analysis. Defaults to the in-cluster kagent A2A Service `http://incident-agent.krateo-system.svc:8080/` (kagent names the Service after the Agent's metadata.name).",
           "default": "http://incident-agent.krateo-system.svc:8080/"
         },
+        "authnUrl": {
+          "type": "string",
+          "title": "authn base URL (intra-service auth)",
+          "description": "Base URL of the authn service. When set, the handler exchanges its projected ServiceAccount token (audience \"authn\") at `<authnUrl>/serviceaccount/login` for a Krateo JWT and presents it on the A2A call, so incident-agent can reach its agentgateway-gated MCP tools; a `serviceaccount.authn.krateo.io` ServiceAccount mapping CR is also rendered. Requires authn's serviceaccount strategy. Empty (default) disables it — the A2A call is unauthenticated (safe on older clusters with no gateway). Enable in-cluster with `http://authn.krateo-system.svc`.",
+          "default": ""
+        },
         "hyperdxApiUrl": {
           "type": "string",
           "title": "HyperDX API URL",
