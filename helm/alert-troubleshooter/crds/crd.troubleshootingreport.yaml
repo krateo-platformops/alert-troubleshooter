@@ -86,6 +86,14 @@ spec:
                     HyperDX-internal alert id, sourced from the triggering Alert CR's
                     status.hyperdxAlertId (the webhook payload's own id is often empty). Enables a
                     robust id-based incident↔alert join independent of any name matching.
+                lifecycle:
+                  type: string
+                  enum: [open, mitigated, resolved]
+                  description: >-
+                    User-settable incident lifecycle — the portal's Resolve/Close action writes it.
+                    The reconciler mirrors it to status.lifecycle; when unset, the reconciler
+                    auto-resolves the report (status.lifecycle -> resolved) once the triggering alert
+                    returns to OK.
             status:
               type: object
               properties:

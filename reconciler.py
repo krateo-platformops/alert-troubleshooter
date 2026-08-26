@@ -25,10 +25,33 @@ import time
 import requests
 
 import hyperdx_v2
-from handler import _k8s, _now  # reuse the apiserver helper + timestamp
+from handler import _get_report, _k8s, _now, _stable_name, patch_status  # reuse the apiserver helpers
 
 GROUP, VERSION, PLURAL = "observability.krateo.io", "v1alpha1", "alerts"
 NAMESPACE = os.environ.get("NAMESPACE", "krateo-system")
+
+
+def _reconcile_report_lifecycle(alert_name, state):
+    """Advance the incident report's lifecycle from the triggering alert's live state:
+      - a user-set spec.lifecycle is mirrored to status.lifecycle (the portal's manual Resolve), and
+      - an alert that has returned to OK auto-resolves its still-open report (-> resolved).
+    Level-based and idempotent — a no-op when there is no report for this alert or nothing changes.
+    Never raises into the reconcile loop."""
+    if not alert_name:
+        return
+    name = _stable_name(alert_name)
+    try:
+        rep = _get_report(NAMESPACE, name)
+        if not rep:
+            return
+        spec_lc = ((rep.get("spec") or {}).get("lifecycle") or "").strip()
+        cur_lc = ((rep.get("status") or {}).get("lifecycle") or "open")
+        desired = spec_lc or ("resolved" if (state == "OK" and cur_lc == "open") else cur_lc)
+        if desired and desired != cur_lc:
+            patch_status(NAMESPACE, name, {"lifecycle": desired})
+            print(f"[reconciler] report {name} lifecycle {cur_lc} -> {desired}", flush=True)
+    except Exception as e:  # noqa: BLE001 — lifecycle bookkeeping must never break alert sync
+        print(f"[reconciler] report {name} lifecycle reconcile skipped ({e})", flush=True)
 INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "60"))
 WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "krateo-autopilot")
 WEBHOOK_TARGET = os.environ.get(
@@ -115,8 +138,9 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
 
     live = {a["id"]: a for a in hdx.list_alerts()}
     if hdx_id and hdx_id in live:
-        _patch_status(name, {"state": live[hdx_id].get("state", "OK"),
-                             "phase": "Synced", "lastSyncedAt": _now()})
+        st = live[hdx_id].get("state", "OK")
+        _patch_status(name, {"state": st, "phase": "Synced", "lastSyncedAt": _now()})
+        _reconcile_report_lifecycle(display, st)
         return
 
     # (re)create: dashboard-tile then alert on it, both ensure-by-name (idempotent)
@@ -126,9 +150,11 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
                              threshold=spec.get("threshold", 1),
                              threshold_type=spec.get("thresholdType", "above"),
                              message=spec.get("message", ""))
+    st = alert.get("state", "OK")
     _patch_status(name, {"hyperdxAlertId": alert["id"], "hyperdxDashboardId": dash_id,
-                         "state": alert.get("state", "OK"), "phase": "Synced", "lastSyncedAt": _now()})
-    print(f"[reconciler] synced Alert {name} -> hyperdx {alert['id']} ({alert.get('state')})", flush=True)
+                         "state": st, "phase": "Synced", "lastSyncedAt": _now()})
+    _reconcile_report_lifecycle(display, st)
+    print(f"[reconciler] synced Alert {name} -> hyperdx {alert['id']} ({st})", flush=True)
 
 
 def reconcile_once(hdx):
