@@ -63,6 +63,15 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        # Intra-service auth (Option A): an audience-bound projected SA token the handler exchanges at
+        # authn for a service JWT. Harmless when config.authnUrl is unset (the handler never reads it).
+        - name: authn-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: authn
+                  expirationSeconds: 600
+                  path: token
       containers:
         - name: handler
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -76,6 +85,12 @@ spec:
               value: {{ .Release.Namespace | quote }}
             - name: AUTOPILOT_A2A_URL
               value: {{ .Values.config.autopilotA2aUrl | quote }}
+            # Intra-service auth (Option A): when set, the handler exchanges the projected SA token
+            # (audience "authn", mounted below) at <authnUrl>/serviceaccount/login for a Krateo JWT and
+            # presents it on the A2A call so incident-agent can reach its agentgateway-gated MCP tools.
+            # Empty (default) = unauthenticated A2A, exactly as before (older clusters with no gateway).
+            - name: AUTHN_URL
+              value: {{ .Values.config.authnUrl | quote }}
             - name: REPORT_COOLDOWN
               value: {{ .Values.config.reportCooldown | quote }}     # dedup window (s): don't re-analyze the same alert within this
             # --- reconciler (Alert CRs -> HyperDX v2 external API, Bearer auth) ---
@@ -102,6 +117,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp                       # only writable path a read-only-root app needs
+            - name: authn-token                     # projected SA token (aud "authn") for intra-service auth
+              mountPath: /var/run/secrets/authn
+              readOnly: true
           resources:
             requests: { cpu: 25m, memory: 64Mi }
             limits: { cpu: 500m, memory: 256Mi }
