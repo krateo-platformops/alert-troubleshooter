@@ -1,0 +1,25 @@
+apiVersion: v2
+name: alert-troubleshooter-crds
+description: Krateo PlatformOps alert-troubleshooter CRDs (Alert + TroubleshootingReport)
+type: application
+
+# Dedicated CRD chart — the platform golden rule (every other component ships a *-crds chart:
+# authn-crds, snowplow-crds, frontend-crds, oasgen-provider-crds). Keeping the Alert +
+# TroubleshootingReport CRDs in their OWN composition DECOUPLES the CRD lifecycle from the app's
+# frequent version bumps: an app-only bump no longer triggers a CRD-version migration of these CRDs,
+# so it can never re-migrate or (on a handover mis-fire) tear them down. See core-provider#89.
+#
+# Versioned with the SAME release tag as the main chart (alert-troubleshooter): release-tag.yaml
+# substitutes the CHART_VERSION placeholder with the git tag, so one repo tag publishes both charts.
+version: CHART_VERSION
+
+home: https://krateo.io
+icon: https://raw.githubusercontent.com/krateo-platformops/.github/main/brand/logo.svg
+keywords:
+  - krateo
+  - platformops
+  - observability
+  - alerts
+  - crd
+sources:
+  - https://github.com/krateo-platformops/alert-troubleshooter
