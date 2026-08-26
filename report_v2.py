@@ -59,6 +59,16 @@ Hard rules for this block:
 - confidence is 0 to 1. remediationPlan is a PLAN only — it will not be executed automatically;
   order the steps, and make each successCriterion independently checkable. Leave observed
   outcomes out; they are recorded later.
+- BE ACTIONABLE: when the evidence identifies a safe corrective write (adjust a limit, fix an
+  image tag, patch an Alert query, delete a stuck object), emit AT LEAST ONE step whose verb is
+  patch/apply/delete with a concrete payload — not a plan made only of "get" verification steps.
+  A remediationPlan that is ENTIRELY "get" steps when a real fix is identifiable is a MISS: an
+  operator can't apply a `get`. Only fall back to get-only when you genuinely cannot determine a
+  safe write from the evidence (say why in missingContext). Keep every existing safety rail — in
+  particular NEVER emit patch/apply/delete for v1/nodes or other cluster-scoped kinds.
+- MARK VERIFICATION-ONLY STEPS: a step that merely CHECKS state (verb "get") must say so in its
+  description (e.g. prefix "Verify: ...") so it is never mistaken for the corrective action. Put
+  the actual corrective write(s) first; list any get-only confirmation steps after them.
 - remediationPlan[].description MUST be a SHORT imperative phrase, ≤60 chars, no trailing period
   (e.g. "Restart payments-api deployment", "Provision payments-db database"). Do NOT put constraints,
   namespaces, ports, or labels in description — those belong in successCriterion. Never repeat

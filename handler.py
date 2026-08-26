@@ -440,6 +440,12 @@ if __name__ == "__main__":
     if os.environ.get("RECONCILER_ENABLED", "true").lower() == "true":
         import reconciler  # imported here so the webhook path has no hard dep on it
         threading.Thread(target=reconciler.run_forever, daemon=True).start()
+    # Background: observe AuditRecords -> fill each applied remediation step's observedOutcome +
+    # auditRecordRefs, closing the remediation loop (the portal flips a step to "applied" on a
+    # non-empty observedOutcome). Correct-but-dormant when provenance isn't enabled / no records flow.
+    if os.environ.get("OBSERVER_ENABLED", "true").lower() == "true":
+        import observer  # imported here so the webhook path has no hard dep on it
+        threading.Thread(target=observer.run_forever, daemon=True).start()
     port = int(os.environ.get("PORT", "8080"))
     print(f"krateo-alert-troubleshooter listening on :{port} → A2A {AUTOPILOT_A2A}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
