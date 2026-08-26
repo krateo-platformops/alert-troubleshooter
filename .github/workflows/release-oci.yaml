@@ -1,0 +1,30 @@
+# Publishes this repo's Helm chart(s) on a release tag via the org-wide reusable — identical to
+# frontend/portal, so "the chart release workflow" is structural (one reusable) instead of a
+# ~130-line self-contained copy each repo keeps in step by hand (which is what the former
+# release-tag.yaml was). The shared workflow substitutes CHART_VERSION + bakes appVersion from the
+# tag, and GATES the publish on every chart-referenced image existing: the alert-troubleshooter
+# chart references ghcr.io/<owner>/alert-troubleshooter:<appVersion=tag>, built by release-tag.yaml,
+# so this waits for that image before publishing (no ImagePullBackOff-after-publish).
+name: release-oci
+
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      chart_version:
+        description: "Chart version (CHART_VERSION). Default: the git tag."
+        required: false
+      app_version:
+        description: "App image version (APP_VERSION). Default: latest tag of the app repo."
+        required: false
+
+jobs:
+  release-oci:
+    uses: krateo-platformops/.github/.github/workflows/release-oci.yaml@main
+    permissions:
+      contents: read
+      packages: write
+    with:
+      chart_version: ${{ github.event.inputs.chart_version || '' }}
+      app_version: ${{ github.event.inputs.app_version || '' }}
