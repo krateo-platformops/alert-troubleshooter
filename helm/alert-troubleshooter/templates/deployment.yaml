@@ -43,6 +43,38 @@ subjects:
     name: krateo-alert-troubleshooter
     namespace: krateo-system
 ---
+# The observer (a thread in the handler image) correlates AuditRecords -> TroubleshootingReport
+# remediation steps CLUSTER-WIDE: a remediation write can target any namespace and its AuditRecord
+# lives next to the target object (observer.py AUDIT_NAMESPACE/REPORT_NAMESPACE default ""=all-ns), so
+# it LISTs auditrecords + troubleshootingreports across all namespaces and PATCHes report status in the
+# report's own namespace. A namespaced Role cannot authorize an all-namespaces list, so this needs a
+# ClusterRole (read auditrecords; read + status-patch reports). The namespaced Role above still covers
+# the handler/reconciler's in-namespace writes (create reports, alerts, the hyperdx-token Secret).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: krateo-alert-troubleshooter-observer
+rules:
+  - apiGroups: ["audit.krateo.io"]
+    resources: ["auditrecords"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["observability.krateo.io"]
+    resources: ["troubleshootingreports", "troubleshootingreports/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: krateo-alert-troubleshooter-observer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: krateo-alert-troubleshooter-observer
+subjects:
+  - kind: ServiceAccount
+    name: krateo-alert-troubleshooter
+    namespace: krateo-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
