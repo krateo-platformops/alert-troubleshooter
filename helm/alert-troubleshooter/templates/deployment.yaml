@@ -48,19 +48,40 @@ subjects:
 # lives next to the target object (observer.py AUDIT_NAMESPACE/REPORT_NAMESPACE default ""=all-ns), so
 # it LISTs auditrecords + troubleshootingreports across all namespaces and PATCHes report status in the
 # report's own namespace. A namespaced Role cannot authorize an all-namespaces list, so this needs a
-# ClusterRole (read auditrecords; read + status-patch reports). The namespaced Role above still covers
-# the handler/reconciler's in-namespace writes (create reports, alerts, the hyperdx-token Secret).
+# ClusterRole. It now also carries the cluster-wide READ the RCA itself needs (see the rules below).
+# The namespaced Role above still covers the handler/reconciler's in-namespace writes (create reports,
+# alerts, the hyperdx-token Secret).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: krateo-alert-troubleshooter-observer
 rules:
-  - apiGroups: ["audit.krateo.io"]
-    resources: ["auditrecords"]
+  # CLUSTER-WIDE READ. The RCA is asked to explain arbitrary cluster failures, so it must be able to
+  # READ arbitrary cluster objects. Without this it could read nothing but its own CRDs, and every
+  # k8s tool call in an analysis came back Forbidden — on krateo-057 three separate reports recorded
+  # it in status.missingContext ("User krateo-alert-troubleshooter cannot get/list ..."), and the
+  # analysis silently fell back to ClickHouse logs alone while still publishing 0.95-0.98 confidence.
+  # An RCA that never read a live object is indistinguishable from a grounded one unless you open
+  # that field, which is the worst property a diagnostic can have.
+  #
+  # This is READ-ONLY and deliberate. It does NOT restore the old confused deputy: that was
+  # `kagent-tools` bound to apiGroups/resources/verbs ALL — full WRITE as a shared, user-facing
+  # identity. That binding was removed when tool calls moved to the caller's identity via the
+  # agentgateway cert-replay hop, and nothing here brings it back. This grants get/list/watch to ONE
+  # non-user-facing analyzer service account.
+  #
+  # It does include secrets cluster-wide, which is the honest cost of "read everything". The
+  # mitigating control is on the LLM path, not here: the agentgateway promptGuard masks key material
+  # and connection strings before anything reaches a model.
+  - apiGroups: ["*"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["*"]
+    verbs: ["get"]
+  # The wildcard above is read-only, so the report status WRITE still needs naming explicitly.
   - apiGroups: ["observability.krateo.io"]
     resources: ["troubleshootingreports", "troubleshootingreports/status"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
