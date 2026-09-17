@@ -68,11 +68,12 @@ rules:
   # `kagent-tools` bound to apiGroups/resources/verbs ALL — full WRITE as a shared, user-facing
   # identity. That binding was removed when tool calls moved to the caller's identity via the
   # agentgateway cert-replay hop, and nothing here brings it back. This grants get/list/watch to ONE
-  # non-user-facing analyzer service account.
+  # non-user-facing analyzer.
   #
   # It does include secrets cluster-wide, which is the honest cost of "read everything". The
   # mitigating control is on the LLM path, not here: the agentgateway promptGuard masks key material
-  # and connection strings before anything reaches a model.
+  # and connection strings before anything reaches a model. Both subjects below are this one
+  # non-user-facing analyzer, reached by its two paths (in-process SA, replayed cert).
   - apiGroups: ["*"]
     resources: ["*"]
     verbs: ["get", "list", "watch"]
@@ -92,9 +93,18 @@ roleRef:
   kind: ClusterRole
   name: krateo-alert-troubleshooter-observer
 subjects:
+  # The in-process observer thread, which talks to the apiserver with the pod's own SA token.
   - kind: ServiceAccount
     name: krateo-alert-troubleshooter
     namespace: krateo-system
+  # The RCA's k8s tool calls, which do NOT arrive as this ServiceAccount. incident-agent runs them
+  # through the agentgateway cert-replay hop: it swaps the caller's authn JWT for the client cert in
+  # <user>-clientconfig, so the apiserver sees that cert's CN as the User and its O= entries as Groups.
+  # The cert carries O=krateo:alert-troubleshooter (serviceaccount-authn.yaml spec.groups), never
+  # system:serviceaccount:..., so only a Group subject authorizes the read granted above.
+  - kind: Group
+    name: krateo:alert-troubleshooter
+    apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: apps/v1
 kind: Deployment
