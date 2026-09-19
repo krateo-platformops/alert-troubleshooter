@@ -170,8 +170,41 @@ def _next_run_count(existing):
         return 1
 
 
+def _owner_reference(ns, alert_ref, alert_namespace, alert_uid):
+    """The ownerReference tying a report to the Alert that produced it — or None.
+
+    WHY IT EXISTS (#35). Nothing in this repo ever deletes a TroubleshootingReport: the handler
+    creates them, `reconciler.py` owns only Alert config + status, and there is no TTL or retention
+    path. With no owner and no finalizer Kubernetes cannot collect them either, so deleting an Alert
+    that has fired leaves its report behind permanently. One owner reference hands the whole
+    lifecycle to the garbage collector, with no new controller and no ongoing cost.
+
+    THREE CONDITIONS, AND EACH ONE PREVENTS A WORSE BUG THAN THE LEAK:
+
+    1. A MATCHED Alert. `_match_alert` is best-effort and returns None on a miss or an API error, so
+       an unmatched report must stay OWNERLESS rather than take a dangling owner — the same
+       condition that already gates the join keys above. A dangling owner reference is not a
+       cosmetic defect: see oasgen-provider#137.
+    2. A UID. An ownerReference is resolved by uid, not by name; a reference with an empty uid names
+       nothing, and a name-only reference to a recreated Alert would point at the wrong object.
+    3. THE SAME NAMESPACE. A namespaced dependent may only be owned by an object in its own
+       namespace. Kubernetes does not ignore a cross-namespace reference — the garbage collector
+       treats the owner as absent and DELETES the dependent, which would turn a slow leak into
+       silent data loss. `_match_alert` lists alerts in the report's own namespace today, so this
+       cannot currently differ; the guard is here so that widening that lookup later fails closed."""
+    if not (alert_ref and alert_uid):
+        return None
+    if alert_namespace and alert_namespace != ns:
+        return None
+    # Not `controller: true`: this is a lifecycle tie, not a claim that a controller reconciles the
+    # report from the Alert. `blockOwnerDeletion` is likewise left off — the Alert must not wait on
+    # the report, and setting it would require delete permission on alerts/finalizers.
+    return {"apiVersion": f"{GROUP}/{VERSION}", "kind": "Alert",
+            "name": alert_ref, "uid": alert_uid}
+
+
 def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
-                   context_id="", alert_ref="", alert_namespace=""):
+                   context_id="", alert_ref="", alert_namespace="", alert_uid=""):
     """Create the alert's report (run-count=1) or bump the existing one (run-count++, last-run=now),
     setting phase=Analyzing. Run info + the per-alert kagent context id live in annotations — no
     TroubleshootingReport CRD change.
@@ -188,11 +221,15 @@ def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, exi
     if alert_namespace:
         join["alertNamespace"] = alert_namespace   # the Alert CR's real namespace (not just the report's)
     if existing is None:
+        meta = {"name": name,
+                "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now,
+                                CONTEXT_ID_ANNO: context_id}}
+        owner = _owner_reference(ns, alert_ref, alert_namespace, alert_uid)
+        if owner:
+            meta["ownerReferences"] = [owner]
         body = {
             "apiVersion": f"{GROUP}/{VERSION}", "kind": "TroubleshootingReport",
-            "metadata": {"name": name,
-                         "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now,
-                                         CONTEXT_ID_ANNO: context_id}},
+            "metadata": meta,
             "spec": ({"alertName": alert_name or "",
                       # default alertNamespace to the report's ns; a matched Alert overrides below
                       "alertNamespace": ns, "prompt": prompt} | join),
@@ -410,6 +447,7 @@ def process(payload):
     alert_id = m_status.get("hyperdxAlertId") or alert_id     # ID join → Alert.status.hyperdxAlertId
     alert_ref = m_meta.get("name", "")                        # stable slug → /alerts/{ns}/{name}
     alert_namespace = m_meta.get("namespace") or alert_ns     # the Alert CR's real namespace
+    alert_uid = m_meta.get("uid", "")                         # owner reference resolves by uid (#35)
     prompt = None  # built after the dedup gate, when we know if this is a re-run
     name = _stable_name(alert_name)
     now = _now()
@@ -427,7 +465,8 @@ def process(payload):
         ctx = _context_id(alert_name, run_count)  # per-alert thread, rotated every CONTEXT_MAX_RUNS
         prompt = build_prompt(alert_name, alert_state, where, message, rerun=bool(existing))
         _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
-                       ctx, alert_ref=alert_ref, alert_namespace=alert_namespace)
+                       ctx, alert_ref=alert_ref, alert_namespace=alert_namespace,
+                       alert_uid=alert_uid)
     try:
         raw, tool_ledger = a2a_analyze(prompt, ctx)
         # v2: split the answer into prose + the structured investigation. Parsing is defensive —

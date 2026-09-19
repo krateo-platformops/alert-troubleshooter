@@ -255,6 +255,83 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertEqual(create["alertNamespace"], "krateo-system")  # defaulted, never empty
         self.assertEqual(create["trigger"], "alert")
 
+    def test_upsert_owns_the_report_by_the_alert_that_produced_it(self):
+        """#35: nothing in this repo deletes a report, so without an owner a fired-then-removed
+        Alert leaks its report forever. The owner is resolved by UID, which is what makes it
+        survive an Alert being recreated under the same name."""
+        h = self._handler()
+        calls = []
+        orig = h._k8s
+        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
+        try:
+            h._upsert_report("krateo-system", "report-x", "\U0001f525 Error log volume", "ALERT",
+                             "6a55c0ba", "prompt", "now", existing=None, context_id="ctx",
+                             alert_ref="error-log-volume", alert_namespace="krateo-system",
+                             alert_uid="3f1c9a20-77e2-4b0e-9a11-0d5e6f7a8b90")
+        finally:
+            h._k8s = orig
+        owners = next(b for m, b in calls if m == "POST")["metadata"]["ownerReferences"]
+        self.assertEqual(len(owners), 1)
+        self.assertEqual(owners[0]["kind"], "Alert")
+        self.assertEqual(owners[0]["apiVersion"], "observability.krateo.io/v1alpha1")
+        self.assertEqual(owners[0]["name"], "error-log-volume")   # the slug, never the emoji name
+        self.assertEqual(owners[0]["uid"], "3f1c9a20-77e2-4b0e-9a11-0d5e6f7a8b90")
+        # Not a controller ref, and it must not block the Alert's own deletion.
+        self.assertNotIn("controller", owners[0])
+        self.assertNotIn("blockOwnerDeletion", owners[0])
+
+    def test_upsert_leaves_an_unmatched_report_ownerless(self):
+        """A dangling owner reference is worse than the leak it would fix. _match_alert is
+        best-effort — a miss or an API error yields no ref and no uid — so the report is created
+        with no ownerReferences key at all rather than one naming nothing."""
+        h = self._handler()
+        for ref, uid in (("", ""), ("error-log-volume", ""), ("", "3f1c9a20-77e2")):
+            calls = []
+            orig = h._k8s
+            h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
+            try:
+                h._upsert_report("krateo-system", "report-x", "orphan-alert", "ALERT", "", "p",
+                                 "now", existing=None, alert_ref=ref, alert_namespace="krateo-system",
+                                 alert_uid=uid)
+            finally:
+                h._k8s = orig
+            create = next(b for m, b in calls if m == "POST")["metadata"]
+            self.assertNotIn("ownerReferences", create, f"ref={ref!r} uid={uid!r}")
+
+    def test_upsert_refuses_a_cross_namespace_owner(self):
+        """THE ONE THAT WOULD COST DATA. A namespaced dependent may only be owned from its own
+        namespace; Kubernetes does not ignore a cross-namespace reference, it treats the owner as
+        absent and DELETES the dependent. _match_alert lists in the report's namespace today, so
+        this cannot happen yet — the guard is what makes widening that lookup fail closed."""
+        h = self._handler()
+        calls = []
+        orig = h._k8s
+        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
+        try:
+            h._upsert_report("krateo-system", "report-x", "x", "ALERT", "id", "p", "now",
+                             existing=None, alert_ref="error-log-volume",
+                             alert_namespace="some-other-namespace", alert_uid="3f1c9a20-77e2")
+        finally:
+            h._k8s = orig
+        self.assertNotIn("ownerReferences", next(b for m, b in calls if m == "POST")["metadata"])
+
+    def test_upsert_does_not_rewrite_owners_on_a_re_run(self):
+        """The re-run patch carries annotations and spec only. Rewriting ownerReferences on every
+        run would clobber an owner anything else had set, so adoption of already-created reports is
+        deliberately NOT done here."""
+        h = self._handler()
+        calls = []
+        orig = h._k8s
+        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
+        try:
+            h._upsert_report("krateo-system", "report-x", "x", "ALERT", "id", "p", "now",
+                             existing={"metadata": {"annotations": {}}}, alert_ref="error-log-volume",
+                             alert_namespace="krateo-system", alert_uid="3f1c9a20-77e2")
+        finally:
+            h._k8s = orig
+        patch = next(b for m, b in calls if m == "PATCH" and b and "spec" in b)
+        self.assertNotIn("ownerReferences", patch["metadata"])
+
     def test_match_alert_matches_emoji_display_name_and_returns_cr(self):
         """The webhook title carries an emoji the Alert's slug/displayName don't; _match_alert
         normalizes both sides and returns the whole Alert CR (id + slug come off it)."""
