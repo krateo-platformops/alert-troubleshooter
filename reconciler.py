@@ -147,7 +147,24 @@ def _push_spec(hdx, cr, source, webhook_id, live_alert):
     spec = cr.get("spec", {})
     status = cr.get("status", {})
     name, display = cr["metadata"]["name"], spec.get("displayName") or cr["metadata"]["name"]
-    dash_id, changed = status.get("hyperdxDashboardId"), []
+
+    # BOTH IDS COME FROM THE LIVE ALERT, and mixing the two sources is a real 400 seen on
+    # krateo-057: `sre-krateo-composition-reconcile-error` evaluates tile 6aa3f3fe…5666 on dashboard
+    # 6aa3f3fe…5667, while its CR status named dashboard 6aae4005…f4e3 — a different one. Sending
+    # that status dashboard id paired with the live tile id describes a tile that is not on that
+    # dashboard, and `validateAlertInput` rejects the whole PUT.
+    #
+    # The silent half was worse than the 400. `where` lands on the dashboard TILE, so a push keyed
+    # on the status id rewrote a tile the alert does not evaluate — a corrected filter written to
+    # the wrong object, reported as success.
+    #
+    # The alert is authoritative about which tile it reads: it is the thing being evaluated. Status
+    # is the fallback for a first push where the live alert carries neither (it always carries both
+    # for a tile-source alert, but falling back keeps this total rather than raising on a shape we
+    # have not seen).
+    dash_id = live_alert.get("dashboardId") or status.get("hyperdxDashboardId")
+    tile_id = live_alert.get("tileId")
+    changed = []
 
     # `where` first: it decides WHAT is counted, so pushing a threshold against a stale filter
     # would briefly evaluate the new bound over the old query.
@@ -164,11 +181,9 @@ def _push_spec(hdx, cr, source, webhook_id, live_alert):
                             threshold_type=spec.get("thresholdType", "above"),
                             message=spec.get("message", ""))
     if drift:
-        # The tile id comes off the LIVE ALERT, not a status field we would have to add. `status`
-        # is a structural schema with no preserve-unknown-fields, so a new key there is pruned
-        # silently — and the alert already knows which tile it evaluates.
-        hdx.update_alert(live_alert["id"], display, dash_id, live_alert.get("tileId") or "count",
-                         webhook_id,
+        # Both ids from the pair resolved above, so the body always describes a tile that is
+        # actually on the dashboard it names.
+        hdx.update_alert(live_alert["id"], display, dash_id, tile_id or "count", webhook_id,
                          interval=spec.get("interval", "5m"),
                          threshold=spec.get("threshold", 1),
                          threshold_type=spec.get("thresholdType", "above"),
