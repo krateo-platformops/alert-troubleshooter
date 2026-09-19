@@ -64,7 +64,13 @@ spec:
                   description: Evaluation window.
                 threshold:
                   type: number
-                  description: Trigger value compared via thresholdType.
+                  description: >
+                    Trigger value compared via thresholdType. The value compared is a COUNT of rows
+                    over the window, so it is never negative — which makes some pairings decided
+                    before any data is read and rejected by the controller with phase: Invalid:
+                    'above 0' (value >= 0) fires on every evaluation including an empty result, and
+                    'below 0' (value < 0) can never fire at all. Use 1 with 'above' for "at least
+                    one", and 1 with 'below' for "none in this window".
                 thresholdType:
                   type: string
                   enum: [above, below, above_exclusive, below_or_equal, equal, not_equal, between, not_between]
@@ -85,7 +91,8 @@ spec:
                 phase:
                   type: string
                   description: >
-                    Reconcile phase. Pending (no HyperDX alert yet) / Synced (the CR's spec IS the
+                    Reconcile phase. Pending (no HyperDX alert yet) / Invalid (the threshold can only
+                    have one outcome — see threshold) / Synced (the CR's spec IS the
                     live alert) / SpecDrift (the spec could not be pushed — the live alert does
                     NOT match this CR) / Error.
                 error:

@@ -130,6 +130,45 @@ def _finalize(hdx, cr):
     print(f"[reconciler] finalized Alert {name} (removed HyperDX alert+dashboard)", flush=True)
 
 
+def tautology(threshold, threshold_type):
+    """Why this alert can never change state — or None if it genuinely can.
+
+    A COUNT IS NEVER NEGATIVE. Every alert here counts rows over a window, so the value compared is
+    an integer >= 0, and some threshold/type pairs are decided before any data is read:
+
+      above 0            value >= 0   — always true. Fires forever, on an empty cluster too.
+      below 0            value <  0   — never true. Silently cannot fire, which is worse: it looks
+                                        armed and is not.
+      below_or_equal -1  value <= -1  — never true, same shape.
+
+    This is not a heuristic about whether an alert is USEFUL. It is arithmetic: the comparison has
+    one possible outcome, so the alert carries no information either way.
+
+    IT HAS COST REAL MONEY TWICE. The 0.1.17 catalogue shipped 25 alerts at `above 0` and every one
+    fired permanently, each firing launching an RCA (observability#60). And an Autopilot-authored
+    alert on krateo-057 — `agent-guardrail-alert`, from the prompt "ok fix this" — reached run 72
+    the same way. Nothing in either path refused it, because nothing was checking.
+
+    Returns a human sentence for the status, since an operator reading `phase: Invalid` needs to
+    know which field to change and to what.
+    """
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError):
+        return None  # not a number: the CRD's own typing owns that, not this
+    kind = (threshold_type or "above").lower()
+    if kind == "above" and value <= 0:
+        return (f"thresholdType 'above' means value >= {threshold}, and a count is never negative — "
+                "this fires on every evaluation including an empty result. Use 1 to mean 'at least one'.")
+    if kind == "below" and value <= 0:
+        return (f"thresholdType 'below' means value < {threshold}, which a count can never satisfy — "
+                "this can never fire. Use 1 to mean 'none in this window'.")
+    if kind == "below_or_equal" and value < 0:
+        return (f"thresholdType 'below_or_equal' means value <= {threshold}, which a count can never "
+                "satisfy — this can never fire. Use 0 to mean 'none in this window'.")
+    return None
+
+
 def _push_spec(hdx, cr, source, webhook_id, live_alert):
     """Push the CR's spec onto the live HyperDX alert when they disagree. Returns what changed.
 
@@ -197,6 +236,20 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
     name = meta["name"]
     display = spec.get("displayName") or name
     hdx_id = status.get("hyperdxAlertId")
+
+    # REFUSE BEFORE CREATING, and refuse an existing one too. A tautological threshold is not a
+    # preference we are overriding: the comparison has one possible outcome, so the alert cannot
+    # signal anything. Creating it anyway is how 25 alerts fired forever and an agent-authored one
+    # reached run 72 — each firing launching an RCA.
+    #
+    # It does NOT delete an alert that already exists. Refusing to keep pushing is enough to stop
+    # the damage, and tearing down an object a person may be looking at, on a rule we just added,
+    # is a bigger action than this warrants. The phase says what to change.
+    why = tautology(spec.get("threshold", 1), spec.get("thresholdType", "above"))
+    if why:
+        _patch_status(name, {"phase": "Invalid", "error": why, "lastSyncedAt": _now()})
+        print(f"[reconciler] Alert {name} refused: {why}", flush=True)
+        return
 
     live = {a["id"]: a for a in hdx.list_alerts()}
     if hdx_id and hdx_id in live:
