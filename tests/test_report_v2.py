@@ -323,12 +323,13 @@ class TestAlertSpecPush(unittest.TestCase):
 
         def __init__(self, live_alert, tile_where=''):
             self.live_alert, self._tile_where = live_alert, tile_where
-            self.alert_puts, self.tile_puts = [], []
+            self.alert_puts, self.tile_puts, self.tile_reads = [], [], []
 
         def list_alerts(self):
             return [self.live_alert]
 
-        def tile_where(self, _dash):
+        def tile_where(self, dash):
+            self.tile_reads.append(dash)
             return self._tile_where
 
         def update_dashboard_tile(self, dash, name, source, where=''):
@@ -341,7 +342,7 @@ class TestAlertSpecPush(unittest.TestCase):
             return {k: (live.get(k), v) for k, v in want.items() if str(live.get(k)) != str(v)}
 
         def update_alert(self, alert_id, name, dash, tile, hook, **fields):
-            self.alert_puts.append({'id': alert_id, 'tile': tile, **fields})
+            self.alert_puts.append({'id': alert_id, 'dash': dash, 'tile': tile, **fields})
             self.live_alert.update({'interval': fields['interval'], 'threshold': fields['threshold'],
                                     'thresholdType': fields['threshold_type'],
                                     'message': fields['message']})
@@ -416,6 +417,43 @@ class TestAlertSpecPush(unittest.TestCase):
         hdx.update_alert = boom
         patched = self._run(r, self._cr(threshold=1), hdx)
         self.assertEqual(patched[-1]['state'], 'ALERT')
+
+    def test_pairs_the_dashboard_and_tile_FROM_THE_SAME_SOURCE(self):
+        """THE 400 SEEN ON krateo-057. `sre-krateo-composition-reconcile-error` evaluates a tile on
+        dashboard 6aa3f3fe…5667 while its CR status named 6aae4005…f4e3 — a different one. Pairing
+        the status dashboard with the live tile describes a tile that is not on that dashboard, and
+        validateAlertInput rejects the whole PUT."""
+        r = self._reconciler()
+        live = self._live(threshold=0, dashboardId='live-dash', tileId='live-tile')
+        hdx = self.FakeHdx(live)
+        cr = self._cr(threshold=1)
+        cr['status']['hyperdxDashboardId'] = 'stale-dash'
+        self._run(r, cr, hdx)
+        self.assertEqual(hdx.alert_puts[0]['tile'], 'live-tile')
+        self.assertEqual(hdx.alert_puts[0].get('dash', 'live-dash'), 'live-dash')
+
+    def test_pushes_WHERE_to_the_dashboard_the_alert_actually_READS(self):
+        """The silent half, and the worse one. `where` lands on the tile, so a push keyed on a
+        stale status id rewrites a tile the alert does not evaluate — a corrected filter written to
+        the wrong object and reported as success."""
+        r = self._reconciler()
+        live = self._live(dashboardId='live-dash', tileId='live-tile')
+        hdx = self.FakeHdx(live, tile_where='old')
+        cr = self._cr(where='new')
+        cr['status']['hyperdxDashboardId'] = 'stale-dash'
+        self._run(r, cr, hdx)
+        self.assertEqual([p['dash'] for p in hdx.tile_puts], ['live-dash'])
+        self.assertEqual(hdx.tile_reads, ['live-dash'])
+
+    def test_falls_back_to_the_status_dashboard_when_the_alert_carries_none(self):
+        r = self._reconciler()
+        live = self._live(threshold=0)
+        live.pop('dashboardId', None)
+        hdx = self.FakeHdx(live, tile_where='w')
+        cr = self._cr(threshold=1, where='w')
+        cr['status']['hyperdxDashboardId'] = 'status-dash'
+        self._run(r, cr, hdx)
+        self.assertEqual(hdx.tile_reads, ['status-dash'])
 
     def test_addresses_the_tile_the_LIVE_ALERT_names(self):
         """Not a status field: `status` is structural with no preserve-unknown-fields, so a new key
