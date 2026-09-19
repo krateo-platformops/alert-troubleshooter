@@ -23,6 +23,16 @@ config:
   reportCooldown: 1800
   # How often (seconds) the reconciler pushes Alert CRs to HyperDX.
   reconcileInterval: 60
+  # Days after which a CLOSED incident report is deleted. 0 (the default) keeps them forever.
+  #
+  # An incident is an AUDIT RECORD: it deliberately outlives the Alert that produced it, so that
+  # "why did this fire in March" stays answerable after the alert has been renamed or retired. That
+  # is why a report carries no ownerReference — Kubernetes would otherwise delete the record along
+  # with its Alert. Set this only if you would rather bound the population than keep the history.
+  #
+  # Only reports that are CLOSED (resolved, or orphaned by their Alert being deleted) and past this
+  # age are reaped. An open incident is never touched, whatever its age.
+  reportRetentionDays: 0
   # Default Alert CRs the reconciler seeds into HyperDX (rendered to DEFAULT_ALERTS_JSON). Set to []
   # to seed none. Each firing auto-launches a full incident-agent RCA, so this default set is kept
   # DELIBERATELY SMALL, PLATFORM-SCOPED and HIGH-THRESHOLD — the goal is a few high-signal alerts that

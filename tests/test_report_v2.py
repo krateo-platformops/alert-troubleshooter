@@ -6,6 +6,7 @@ Run from the repo root:  python3 -m unittest discover -s tests -v
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -304,3 +305,87 @@ class TestYamlThenJsonFixture(unittest.TestCase):
         # the yaml example stays in the prose; the json block is stripped
         self.assertIn("```yaml", prose)
         self.assertNotIn('"remediationPlan"', prose)
+
+
+class TestReportRetention(unittest.TestCase):
+    """#35/#36: an incident is an AUDIT RECORD — it outlives the Alert that produced it, which is
+    why a report carries no ownerReference. Retention is the opt-in way to bound the population
+    without handing the lifecycle to Kubernetes."""
+
+    def _reconciler(self, days):
+        import importlib
+        import reconciler as r
+        importlib.reload(r)
+        r.REPORT_RETENTION_DAYS = days
+        return r
+
+    @staticmethod
+    def _report(name, *, age_days, lifecycle="resolved", phase="Ready", alert_ref="a-1"):
+        when = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat().replace("+00:00", "Z")
+        return {"metadata": {"name": name, "creationTimestamp": when},
+                "spec": {"alertRef": alert_ref},
+                "status": {"completedAt": when, "lifecycle": lifecycle, "phase": phase}}
+
+    def _reap(self, r, reports, live_alerts=("a-1",)):
+        deleted, orig_k8s, orig_list = [], r._k8s, r._list_alert_crs
+
+        def fake_k8s(method, path, body=None, subresource=""):
+            if method == "DELETE":
+                deleted.append(path.rsplit("/", 1)[-1])
+                return {}
+            return {"items": reports}
+        r._k8s = fake_k8s
+        r._list_alert_crs = lambda: [{"metadata": {"name": n}} for n in live_alerts]
+        try:
+            r.reap_expired_reports()
+        finally:
+            r._k8s, r._list_alert_crs = orig_k8s, orig_list
+        return deleted
+
+    def test_keeps_everything_when_retention_is_off(self):
+        """The DEFAULT. An upgrade must not silently delete anyone's audit history."""
+        r = self._reconciler(0)
+        self.assertEqual(self._reap(r, [self._report("old", age_days=3650)]), [])
+
+    def test_never_reaps_an_open_incident_however_old(self):
+        """An open incident is live work and sits in the portal's incidents list."""
+        r = self._reconciler(30)
+        kept = self._report("still-open", age_days=3650, lifecycle="open")
+        self.assertEqual(self._reap(r, [kept]), [])
+
+    def test_never_reaps_an_incident_still_being_analyzed(self):
+        r = self._reconciler(30)
+        mid = self._report("mid-rca", age_days=3650, lifecycle="resolved", phase="Analyzing")
+        self.assertEqual(self._reap(r, [mid]), [])
+
+    def test_reaps_a_closed_incident_past_the_window(self):
+        r = self._reconciler(30)
+        self.assertEqual(self._reap(r, [self._report("old-closed", age_days=45)]), ["old-closed"])
+
+    def test_keeps_a_closed_incident_inside_the_window(self):
+        r = self._reconciler(30)
+        self.assertEqual(self._reap(r, [self._report("recent", age_days=5)]), [])
+
+    def test_reaps_an_ORPHAN_even_though_it_is_still_open(self):
+        """THE CASE #35 IS ACTUALLY ABOUT. A report whose Alert was deleted can never be resolved
+        again — the reconcile loop iterates Alert CRs and this one has none — so without this it
+        would be immortal even with retention switched on."""
+        r = self._reconciler(30)
+        orphan = self._report("orphan", age_days=45, lifecycle="open", alert_ref="deleted-alert")
+        self.assertEqual(self._reap(r, [orphan], live_alerts=("a-1",)), ["orphan"])
+
+    def test_refuses_to_reap_when_the_age_cannot_be_read(self):
+        """An unparseable timestamp is not an age of zero and not an age of infinity — deleting on
+        one is how a retention knob eats the whole namespace."""
+        r = self._reconciler(30)
+        junk = {"metadata": {"name": "junk", "creationTimestamp": "not-a-date"},
+                "spec": {"alertRef": "a-1"},
+                "status": {"completedAt": None, "lifecycle": "resolved", "phase": "Ready"}}
+        self.assertEqual(self._reap(r, [junk]), [])
+
+    def test_ages_from_the_NEWEST_timestamp_not_the_creation_one(self):
+        """A report re-run yesterday is young, however old its first run was."""
+        r = self._reconciler(30)
+        rep = self._report("rerun", age_days=400)
+        rep["status"]["completedAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.assertEqual(self._reap(r, [rep]), [])

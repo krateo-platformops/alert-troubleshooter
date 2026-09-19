@@ -100,6 +100,13 @@
           "description": "How often (seconds) the reconciler pushes Alert CRs to HyperDX.",
           "default": 60
         },
+        "reportRetentionDays": {
+          "type": "integer",
+          "title": "Report retention (days)",
+          "description": "Delete CLOSED incident reports older than this many days. 0 (default) keeps every report forever — an incident is an audit record and outlives the alert that produced it. Open incidents are never reaped.",
+          "minimum": 0,
+          "default": 0
+        },
         "defaultAlerts": {
           "type": "array",
           "title": "Default alerts",
