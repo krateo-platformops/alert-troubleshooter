@@ -130,6 +130,53 @@ def _finalize(hdx, cr):
     print(f"[reconciler] finalized Alert {name} (removed HyperDX alert+dashboard)", flush=True)
 
 
+def _push_spec(hdx, cr, source, webhook_id, live_alert):
+    """Push the CR's spec onto the live HyperDX alert when they disagree. Returns what changed.
+
+    THE MISSING HALF OF THE RECONCILER (#38). Once a CR had `status.hyperdxAlertId`, this function
+    did not exist: the loop mirrored state back from HyperDX and returned, so every edit after
+    creation — threshold, thresholdType, where, interval, message — was silently ignored while the
+    CR reported `phase: Synced`. The 0.1.18 catalogue that corrected 25 off-by-one thresholds was
+    therefore completely inert on any cluster that already had them: correct on a fresh install,
+    and nothing on an upgrade.
+
+    TWO OBJECTS, BECAUSE THE SPEC SPANS TWO. `threshold`/`thresholdType`/`interval`/`message` live
+    on the ALERT; `where` lives on the dashboard TILE. A push that only did the first would leave a
+    corrected filter unapplied, which is the same silent failure one level down.
+    """
+    spec = cr.get("spec", {})
+    status = cr.get("status", {})
+    name, display = cr["metadata"]["name"], spec.get("displayName") or cr["metadata"]["name"]
+    dash_id, changed = status.get("hyperdxDashboardId"), []
+
+    # `where` first: it decides WHAT is counted, so pushing a threshold against a stale filter
+    # would briefly evaluate the new bound over the old query.
+    want_where = spec.get("where", "")
+    if dash_id:
+        live_where = hdx.tile_where(dash_id)
+        if live_where is not None and live_where != want_where:
+            hdx.update_dashboard_tile(dash_id, f"krateo-alert-{name}", source, want_where)
+            changed.append("where")
+
+    drift = hdx.alert_drift(live_alert,
+                            interval=spec.get("interval", "5m"),
+                            threshold=spec.get("threshold", 1),
+                            threshold_type=spec.get("thresholdType", "above"),
+                            message=spec.get("message", ""))
+    if drift:
+        # The tile id comes off the LIVE ALERT, not a status field we would have to add. `status`
+        # is a structural schema with no preserve-unknown-fields, so a new key there is pruned
+        # silently — and the alert already knows which tile it evaluates.
+        hdx.update_alert(live_alert["id"], display, dash_id, live_alert.get("tileId") or "count",
+                         webhook_id,
+                         interval=spec.get("interval", "5m"),
+                         threshold=spec.get("threshold", 1),
+                         threshold_type=spec.get("thresholdType", "above"),
+                         message=spec.get("message", ""))
+        changed.extend(sorted(drift))
+    return changed
+
+
 def _reconcile_cr(hdx, cr, source, webhook_id):
     meta, spec, status = cr["metadata"], cr.get("spec", {}), cr.get("status", {})
     name = meta["name"]
@@ -139,7 +186,22 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
     live = {a["id"]: a for a in hdx.list_alerts()}
     if hdx_id and hdx_id in live:
         st = live[hdx_id].get("state", "OK")
+        # PUSH BEFORE MIRRORING. The old order was "mirror and return", which is what made the CR
+        # assert agreement it had never established.
+        try:
+            changed = _push_spec(hdx, cr, source, webhook_id, live[hdx_id])
+        except Exception as e:  # noqa: BLE001 — a failed push must not stop state mirroring
+            # AND MUST NOT CLAIM Synced. `phase` used to say Synced unconditionally here; saying it
+            # while the spec sits unpushed is what cost an afternoon to find, because the status
+            # actively asserted the opposite of the truth.
+            _patch_status(name, {"state": st, "phase": "SpecDrift", "error": str(e)[:300],
+                                 "lastSyncedAt": _now()})
+            print(f"[reconciler] Alert {name}: spec push failed, phase=SpecDrift ({e})", flush=True)
+            _reconcile_report_lifecycle(display, st)
+            return
         _patch_status(name, {"state": st, "phase": "Synced", "lastSyncedAt": _now()})
+        if changed:
+            print(f"[reconciler] Alert {name}: pushed {', '.join(changed)} to hyperdx {hdx_id}", flush=True)
         _reconcile_report_lifecycle(display, st)
         return
 
@@ -158,6 +220,9 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
 
 
 def reconcile_once(hdx):
+    # One pass = one view of the dashboards. Cleared here rather than aged, so a `where` comparison
+    # can never read an answer from a previous cycle.
+    hdx.invalidate_cache()
     source = hdx.first_source()
     webhook_id, recreated = hdx.ensure_webhook(WEBHOOK_NAME, WEBHOOK_TARGET,
                                                description="Krateo Autopilot auto-troubleshooter")

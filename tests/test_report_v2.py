@@ -304,3 +304,175 @@ class TestYamlThenJsonFixture(unittest.TestCase):
         # the yaml example stays in the prose; the json block is stripped
         self.assertIn("```yaml", prose)
         self.assertNotIn('"remediationPlan"', prose)
+
+
+class TestAlertSpecPush(unittest.TestCase):
+    """#38: the reconciler had no update path, so every edit after creation was silently ignored
+    while the CR reported phase: Synced. This is what makes 0.1.18's corrected thresholds reach a
+    cluster that already had the alerts."""
+
+    def _reconciler(self):
+        import importlib
+        import reconciler as r
+        importlib.reload(r)
+        return r
+
+    class FakeHdx:
+        """Records what was pushed. `state` comes back from the live alert, as the real one does."""
+        MUTABLE = ("interval", "threshold", "thresholdType", "message")
+
+        def __init__(self, live_alert, tile_where=''):
+            self.live_alert, self._tile_where = live_alert, tile_where
+            self.alert_puts, self.tile_puts = [], []
+
+        def list_alerts(self):
+            return [self.live_alert]
+
+        def tile_where(self, _dash):
+            return self._tile_where
+
+        def update_dashboard_tile(self, dash, name, source, where=''):
+            self.tile_puts.append({'dash': dash, 'where': where})
+            self._tile_where = where
+
+        def alert_drift(self, live, **desired):
+            want = {'interval': desired['interval'], 'threshold': desired['threshold'],
+                    'thresholdType': desired['threshold_type'], 'message': desired['message']}
+            return {k: (live.get(k), v) for k, v in want.items() if str(live.get(k)) != str(v)}
+
+        def update_alert(self, alert_id, name, dash, tile, hook, **fields):
+            self.alert_puts.append({'id': alert_id, 'tile': tile, **fields})
+            self.live_alert.update({'interval': fields['interval'], 'threshold': fields['threshold'],
+                                    'thresholdType': fields['threshold_type'],
+                                    'message': fields['message']})
+            return {'id': alert_id, 'state': self.live_alert.get('state', 'OK')}
+
+    @staticmethod
+    def _cr(**spec):
+        base = {'interval': '5m', 'threshold': 1, 'thresholdType': 'above', 'message': 'm', 'where': 'w'}
+        base.update(spec)
+        return {'metadata': {'name': 'a-1'}, 'spec': base,
+                'status': {'hyperdxAlertId': 'h1', 'hyperdxDashboardId': 'd1'}}
+
+    @staticmethod
+    def _live(**over):
+        base = {'id': 'h1', 'state': 'ALERT', 'interval': '5m', 'threshold': 1,
+                'thresholdType': 'above', 'message': 'm', 'tileId': 'count'}
+        base.update(over)
+        return base
+
+    def _run(self, r, cr, hdx):
+        patched = []
+        r._patch_status = lambda name, st: patched.append(st)
+        r._reconcile_report_lifecycle = lambda *a, **k: None
+        r._reconcile_cr(hdx, cr, {'id': 's1'}, 'hook1')
+        return patched
+
+    def test_pushes_a_corrected_threshold_instead_of_ignoring_it(self):
+        """THE BUG. 0.1.18 corrected 25 thresholds from 0 to 1; on an upgrade every CR already had
+        a hyperdxAlertId, so every one took the early return and the fix was completely inert."""
+        r = self._reconciler()
+        hdx = self.FakeHdx(self._live(threshold=0))
+        self._run(r, self._cr(threshold=1), hdx)
+        self.assertEqual(len(hdx.alert_puts), 1)
+        self.assertEqual(hdx.alert_puts[0]['threshold'], 1)
+
+    def test_pushes_a_changed_where_to_the_dashboard_TILE(self):
+        """`where` is a property of the tile, not the alert. A push that only did the alert would
+        leave a corrected filter unapplied — the same silent failure one level down."""
+        r = self._reconciler()
+        hdx = self.FakeHdx(self._live(), tile_where='old')
+        self._run(r, self._cr(where='new'), hdx)
+        self.assertEqual([p['where'] for p in hdx.tile_puts], ['new'])
+
+    def test_pushes_NOTHING_when_the_spec_already_matches(self):
+        """The common case is no change, and it must stay a read: a push every cycle would rewrite
+        all 25 alerts once a minute forever."""
+        r = self._reconciler()
+        hdx = self.FakeHdx(self._live(), tile_where='w')
+        patched = self._run(r, self._cr(), hdx)
+        self.assertEqual(hdx.alert_puts, [])
+        self.assertEqual(hdx.tile_puts, [])
+        self.assertEqual(patched[-1]['phase'], 'Synced')
+
+    def test_does_NOT_report_Synced_when_the_push_FAILED(self):
+        """The status actively asserted the opposite of the truth, which is what made this cost an
+        afternoon to find. A failed push is SpecDrift: the live alert does not match this CR."""
+        r = self._reconciler()
+        hdx = self.FakeHdx(self._live(threshold=0))
+        def boom(*a, **k):
+            raise RuntimeError('hyperdx said no')
+        hdx.update_alert = boom
+        patched = self._run(r, self._cr(threshold=1), hdx)
+        self.assertEqual(patched[-1]['phase'], 'SpecDrift')
+        self.assertIn('hyperdx said no', patched[-1]['error'])
+
+    def test_mirrors_the_live_STATE_even_when_the_push_failed(self):
+        """Losing the alert's state on top of a failed push would hide that it is firing."""
+        r = self._reconciler()
+        hdx = self.FakeHdx(self._live(threshold=0, state='ALERT'))
+        def boom(*a, **k):
+            raise RuntimeError('nope')
+        hdx.update_alert = boom
+        patched = self._run(r, self._cr(threshold=1), hdx)
+        self.assertEqual(patched[-1]['state'], 'ALERT')
+
+    def test_addresses_the_tile_the_LIVE_ALERT_names(self):
+        """Not a status field: `status` is structural with no preserve-unknown-fields, so a new key
+        there is pruned silently. The alert already knows which tile it evaluates."""
+        r = self._reconciler()
+        hdx = self.FakeHdx(self._live(threshold=0, tileId='tile-xyz'))
+        self._run(r, self._cr(threshold=1), hdx)
+        self.assertEqual(hdx.alert_puts[0]['tile'], 'tile-xyz')
+
+
+class TestEnsureAlertReconciles(unittest.TestCase):
+    """#38's second barrier: `ensure_alert` was ensure-EXISTS, so it returned a name-matched alert
+    untouched. That is what defeated the obvious operator recovery — clearing
+    `status.hyperdxAlertId` sent the CR back down the create path and it handed back the same stale
+    alert, leaving no way to change a threshold from the Kubernetes side at all."""
+
+    def _hdx(self, live):
+        import hyperdx_v2
+        h = hyperdx_v2.HyperDXV2.__new__(hyperdx_v2.HyperDXV2)
+        h._dashboards = None
+        h.calls = []
+
+        def fake_req(method, path, body=None):
+            h.calls.append((method, path, body))
+            if method == 'GET' and path == '/api/v2/alerts':
+                return live
+            if method == 'PUT':
+                return {'id': path.rsplit('/', 1)[-1], 'state': 'OK'}
+            return {'id': 'new-1', 'state': 'OK'}
+        h._req = fake_req
+        return h
+
+    def test_UPDATES_a_name_matched_alert_whose_threshold_drifted(self):
+        h = self._hdx([{'id': 'h1', 'name': 'my-alert', 'state': 'ALERT',
+                        'interval': '5m', 'threshold': 0, 'thresholdType': 'above', 'message': 'm'}])
+        out = h.ensure_alert('my-alert', 'd1', 'count', 'hook', threshold=1, message='m')
+        self.assertEqual(out['id'], 'h1')
+        puts = [c for c in h.calls if c[0] == 'PUT']
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0][2]['threshold'], 1)
+
+    def test_does_NOT_write_when_the_name_match_already_agrees(self):
+        h = self._hdx([{'id': 'h1', 'name': 'my-alert', 'state': 'OK',
+                        'interval': '5m', 'threshold': 1, 'thresholdType': 'above', 'message': 'm'}])
+        h.ensure_alert('my-alert', 'd1', 'count', 'hook', threshold=1, message='m')
+        self.assertEqual([c for c in h.calls if c[0] in ('PUT', 'POST')], [])
+
+    def test_compares_as_STRINGS_so_1_and_quoted_1_are_not_perpetual_drift(self):
+        """The API returns threshold as a number and a CR may carry either; `1 != "1"` would be a
+        drift corrected on every cycle, rewriting the alert forever."""
+        h = self._hdx([{'id': 'h1', 'name': 'my-alert', 'state': 'OK',
+                        'interval': '5m', 'threshold': 1, 'thresholdType': 'above', 'message': 'm'}])
+        h.ensure_alert('my-alert', 'd1', 'count', 'hook', threshold='1', message='m')
+        self.assertEqual([c for c in h.calls if c[0] == 'PUT'], [])
+
+    def test_still_CREATES_when_no_alert_carries_the_name(self):
+        h = self._hdx([])
+        out = h.ensure_alert('my-alert', 'd1', 'count', 'hook', threshold=1)
+        self.assertEqual(out['id'], 'new-1')
+        self.assertEqual([c[0] for c in h.calls if c[0] == 'POST'], ['POST'])

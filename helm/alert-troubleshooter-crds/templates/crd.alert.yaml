@@ -52,8 +52,11 @@ spec:
                   type: string
                   default: ""
                   description: >
-                    Lucene filter over the logs source counted by the alert (empty = all rows).
-                    e.g. 'SeverityText:error OR SeverityText:warn'.
+                    ClickHouse SQL filter over the logs source counted by the alert (empty = all
+                    rows) — NOT Lucene, which this field's description claimed until observability#57.
+                    The controller pins whereLanguage:"sql" on the tile; a Lucene-shaped filter is
+                    parsed as SQL, matches nothing, and the alert can never fire.
+                    e.g. ServiceName = 'krateo' AND SeverityNumber >= 17.
                 interval:
                   type: string
                   enum: ["1m", "5m", "15m", "30m", "1h", "6h", "12h", "1d"]
@@ -81,7 +84,10 @@ spec:
                   description: Live HyperDX alert state (OK / ALERT / PENDING).
                 phase:
                   type: string
-                  description: Reconcile phase (Pending / Synced / Error).
+                  description: >
+                    Reconcile phase. Pending (no HyperDX alert yet) / Synced (the CR's spec IS the
+                    live alert) / SpecDrift (the spec could not be pushed — the live alert does
+                    NOT match this CR) / Error.
                 error:
                   type: string
                 lastSyncedAt:
