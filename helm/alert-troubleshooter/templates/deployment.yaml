@@ -19,7 +19,9 @@ metadata:
 rules:
   - apiGroups: ["observability.krateo.io"]
     resources: ["troubleshootingreports", "troubleshootingreports/status"]
-    verbs: ["create", "get", "list", "patch", "update"]
+    # `delete` is used ONLY by the retention reap, which is off unless REPORT_RETENTION_DAYS > 0.
+    # Granted unconditionally so switching the knob on is a values change and not a role change.
+    verbs: ["create", "get", "list", "patch", "update", "delete"]
   # the reconciler reads Alert CRs (desired), seeds defaults, and writes their status
   - apiGroups: ["observability.krateo.io"]
     resources: ["alerts", "alerts/status"]
@@ -153,6 +155,8 @@ spec:
               valueFrom: { secretKeyRef: { name: hyperdx-api-token, key: accessKey } }
             - name: RECONCILE_INTERVAL
               value: {{ .Values.config.reconcileInterval | quote }}
+            - name: REPORT_RETENTION_DAYS
+              value: {{ .Values.config.reportRetentionDays | quote }}  # 0 = keep every report (an incident outlives its alert)
             # default Alert CRs seeded by the reconciler (not shipped as CRs — CRD-order safe).
             # `${NAMESPACE}` in a default alert's SQL `where` is substituted with the release namespace
             # here, so the platform-scoped defaults are portable across a non-default krateo namespace.

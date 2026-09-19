@@ -10,6 +10,9 @@ Runs as a background thread in the krateo-alert-troubleshooter process:
         else, no status.hyperdxAlertId    -> create dashboard-tile + alert, record ids in status
         else                              -> mirror the live alert state (OK/ALERT/PENDING) to status
     (a finalizer on each CR guarantees the HyperDX resources are removed before the CR is deleted)
+    then, when REPORT_RETENTION_DAYS > 0: delete CLOSED TroubleshootingReports past that age.
+    Reports are deliberately NOT owned by their Alert — an incident outlives the alert that
+    produced it, so retention is opt-in bookkeeping rather than Kubernetes garbage collection.
 
 Alerts flow: HyperDX evaluates the alert; when it fires it POSTs the webhook -> this service's
 /webhook -> Autopilot RCA -> TroubleshootingReport. The reconciler only manages config + status.
@@ -25,10 +28,27 @@ import time
 import requests
 
 import hyperdx_v2
-from handler import _get_report, _k8s, _now, _stable_name, patch_status  # reuse the apiserver helpers
+from datetime import datetime, timezone
+
+from handler import (LAST_RUN_ANNO, PLURAL as REPORTS, _get_report, _k8s, _now, _stable_name,
+                     patch_status)  # reuse the apiserver helpers
 
 GROUP, VERSION, PLURAL = "observability.krateo.io", "v1alpha1", "alerts"
 NAMESPACE = os.environ.get("NAMESPACE", "krateo-system")
+
+# Days after which a CLOSED incident may be reaped. 0 (the default) = keep forever.
+#
+# OFF BY DEFAULT, DELIBERATELY. An incident report is an audit record: it is expected to outlive the
+# Alert that produced it, so that "why did this fire in March" is still answerable after the alert
+# has been renamed or retired. That is the product decision this knob is built around, and it is why
+# there is no ownerReference on a report — Kubernetes would then delete the record with its Alert,
+# which is exactly the behaviour we do NOT want (#35, #36).
+#
+# What it fixes is the other half of #35: nothing could reap a report even when an operator wanted
+# to. Turning this on is an explicit choice to trade audit history for a bounded population; leaving
+# it at 0 keeps today's behaviour byte for byte, so an upgrade never silently deletes anyone's
+# records.
+REPORT_RETENTION_DAYS = int(os.environ.get("REPORT_RETENTION_DAYS", "0"))
 
 
 def _reconcile_report_lifecycle(alert_name, state):
@@ -52,6 +72,86 @@ def _reconcile_report_lifecycle(alert_name, state):
             print(f"[reconciler] report {name} lifecycle {cur_lc} -> {desired}", flush=True)
     except Exception as e:  # noqa: BLE001 — lifecycle bookkeeping must never break alert sync
         print(f"[reconciler] report {name} lifecycle reconcile skipped ({e})", flush=True)
+def _report_age_days(rep):
+    """Days since this report last did anything — or None when no timestamp can be read.
+
+    Newest wins: a report that completed, was re-run, or was merely created is aged from whichever
+    of those happened last. None means "cannot tell", and an unreadable timestamp must never be
+    treated as old — see the caller.
+    """
+    meta, status = rep.get("metadata") or {}, rep.get("status") or {}
+    stamps = [status.get("completedAt"), (meta.get("annotations") or {}).get(LAST_RUN_ANNO),
+              meta.get("creationTimestamp")]
+    newest = None
+    for ts in stamps:
+        try:
+            when = datetime.fromisoformat((ts or "").replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if newest is None or when > newest:
+            newest = when
+    if newest is None:
+        return None
+    return (datetime.now(timezone.utc) - newest).total_seconds() / 86400.0
+
+
+def _reapable(rep, live_alert_refs):
+    """May this report be reaped? Three conditions, and every one of them protects a record.
+
+    1. IT IS NOT OPEN. An open incident is live work — someone is looking at it, and the portal
+       shows it in the incidents list. Only a report the loop has resolved (the alert returned to
+       OK) or a person closed is a candidate. Phase matters too: a report still Analyzing has no
+       useful timestamps and a half-written RCA is not an audit record.
+    2. IT IS OLDER THAN THE WINDOW. Measured from the last thing that happened to it, so a report
+       re-run yesterday is young however old its first run was. An age that cannot be READ is not
+       an age of zero and not an age of infinity — it is a refusal, because deleting on a timestamp
+       we failed to parse is how a retention knob eats the whole namespace.
+    3. ITS ALERT IS GONE, or it is closed on its own terms. An orphan — a report whose Alert has
+       been deleted — is the case #35 is actually about. It can never be resolved by the reconcile
+       loop again, because that loop iterates Alert CRs and this one has none, so without this
+       clause an orphan left `open` would be immortal even with retention switched on.
+    """
+    age = _report_age_days(rep)
+    if age is None or age < REPORT_RETENTION_DAYS:
+        return False
+    status, spec = rep.get("status") or {}, rep.get("spec") or {}
+    if (status.get("phase") or "") in ("Pending", "Analyzing"):
+        return False
+    orphaned = bool(spec.get("alertRef")) and spec["alertRef"] not in live_alert_refs
+    return ((status.get("lifecycle") or "open") != "open") or orphaned
+
+
+def reap_expired_reports():
+    """Delete closed incidents past the retention window. A no-op unless REPORT_RETENTION_DAYS > 0.
+
+    Level-based and idempotent, like everything else in this loop: it re-derives what is expired
+    from the live objects every cycle and holds no state. Never raises into the caller — losing a
+    reap cycle costs nothing, while breaking alert sync costs alerting.
+    """
+    if REPORT_RETENTION_DAYS <= 0:
+        return 0
+    try:
+        reports = _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{NAMESPACE}/{REPORTS}").get("items", [])
+        # The live Alert slugs, so an orphan is identified by absence rather than guessed at. Read
+        # ONCE per cycle: a per-report lookup would be N gets against the apiserver for no gain.
+        live = {(cr.get("metadata") or {}).get("name", "") for cr in _list_alert_crs()}
+    except Exception as e:  # noqa: BLE001 — a failed list must not stall alert reconciliation
+        print(f"[reconciler] report reap skipped ({e})", flush=True)
+        return 0
+    reaped = 0
+    for rep in reports:
+        name = (rep.get("metadata") or {}).get("name", "")
+        if not name or not _reapable(rep, live):
+            continue
+        try:
+            _k8s("DELETE", f"/apis/{GROUP}/{VERSION}/namespaces/{NAMESPACE}/{REPORTS}/{name}")
+            reaped += 1
+            print(f"[reconciler] reaped report {name} (closed, older than {REPORT_RETENTION_DAYS}d)", flush=True)
+        except Exception as e:  # noqa: BLE001 — one stubborn report shouldn't stop the rest
+            print(f"[reconciler] report {name} reap failed: {e}", flush=True)
+    return reaped
+
+
 INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "60"))
 WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "krateo-autopilot")
 WEBHOOK_TARGET = os.environ.get(
@@ -200,13 +300,17 @@ def run_forever():
         print("[reconciler] HYPERDX_ACCESS_KEY unset — reconciler disabled", flush=True)
         return
     hdx = hyperdx_v2.HyperDXV2(api_url, access_key)
-    print(f"[reconciler] started (interval={INTERVAL}s, api={api_url})", flush=True)
+    retention = f"{REPORT_RETENTION_DAYS}d" if REPORT_RETENTION_DAYS > 0 else "off (reports kept)"
+    print(f"[reconciler] started (interval={INTERVAL}s, api={api_url}, report-retention={retention})", flush=True)
     seeded = False
     while True:
         try:
             if not seeded:
                 seeded = seed_default_alerts()  # k8s-only; retries until the Alert CRD is ready
             reconcile_once(hdx)
+            # After the alerts, and outside their error path: reaping is bookkeeping, and a bad
+            # cycle of it must not cost an alert sync.
+            reap_expired_reports()
         except requests.HTTPError as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
             print(f"[reconciler] http error ({code}); will retry: {e}", flush=True)
