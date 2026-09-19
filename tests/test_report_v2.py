@@ -514,3 +514,72 @@ class TestEnsureAlertReconciles(unittest.TestCase):
         out = h.ensure_alert('my-alert', 'd1', 'count', 'hook', threshold=1)
         self.assertEqual(out['id'], 'new-1')
         self.assertEqual([c[0] for c in h.calls if c[0] == 'POST'], ['POST'])
+
+
+class TestTautologicalThresholds(unittest.TestCase):
+    """A count is never negative, so some threshold/type pairs are decided before any data is read.
+    Refusing them is arithmetic, not taste — and it has cost real money twice: the 0.1.17 catalogue
+    shipped 25 alerts at `above 0`, and an Autopilot-authored alert on krateo-057 reached run 72 the
+    same way, each firing launching an RCA."""
+
+    def _r(self):
+        import importlib
+        import reconciler as r
+        importlib.reload(r)
+        return r
+
+    def test_above_zero_is_refused_it_fires_on_an_empty_result(self):
+        r = self._r()
+        why = r.tautology(0, 'above')
+        self.assertIsNotNone(why)
+        self.assertIn('every evaluation', why)
+        self.assertIn('Use 1', why)          # says which value, not just that it is wrong
+
+    def test_below_zero_is_refused_it_can_NEVER_fire(self):
+        """The worse shape: it looks armed and is not."""
+        self.assertIsNotNone(self._r().tautology(0, 'below'))
+
+    def test_below_or_equal_minus_one_is_refused(self):
+        self.assertIsNotNone(self._r().tautology(-1, 'below_or_equal'))
+
+    def test_the_ordinary_thresholds_are_ALLOWED(self):
+        r = self._r()
+        for value, kind in ((1, 'above'), (3, 'above'), (100, 'below'), (0, 'below_or_equal'), (11, 'above')):
+            self.assertIsNone(r.tautology(value, kind), f'{kind} {value} must be allowed')
+
+    def test_a_non_numeric_threshold_is_left_to_the_CRD(self):
+        """The CRD types this field; duplicating that here would be a second opinion that can drift."""
+        self.assertIsNone(self._r().tautology(None, 'above'))
+        self.assertIsNone(self._r().tautology('abc', 'above'))
+
+    def test_reconcile_REFUSES_and_says_what_to_change(self):
+        r = self._r()
+        patched = []
+        r._patch_status = lambda name, st: patched.append(st)
+        calls = []
+
+        class Hdx:
+            def list_alerts(self):
+                calls.append('list')
+                return []
+        r._reconcile_cr(Hdx(), {'metadata': {'name': 'bad'}, 'spec': {'threshold': 0, 'thresholdType': 'above'},
+                                'status': {}}, {'id': 's'}, 'hook')
+        self.assertEqual(patched[-1]['phase'], 'Invalid')
+        self.assertIn('Use 1', patched[-1]['error'])
+        self.assertEqual(calls, [])   # refused BEFORE touching HyperDX at all
+
+    def test_refusing_does_NOT_delete_an_alert_that_already_exists(self):
+        """Stopping the pushes is enough to stop the damage. Tearing down an object someone may be
+        looking at, on a rule we just added, is a bigger action than this warrants."""
+        r = self._r()
+        deleted = []
+        r._patch_status = lambda name, st: None
+
+        class Hdx:
+            def list_alerts(self):
+                return [{'id': 'h1', 'state': 'ALERT'}]
+            def delete_alert(self, i):
+                deleted.append(i)
+        r._reconcile_cr(Hdx(), {'metadata': {'name': 'bad'}, 'spec': {'threshold': 0, 'thresholdType': 'above'},
+                                'status': {'hyperdxAlertId': 'h1'}}, {'id': 's'}, 'hook')
+        self.assertEqual(deleted, [])
