@@ -136,31 +136,22 @@ class HyperDXV2:
         """Ensure a single-tile dashboard `name` with a count-over-time line chart.
 
         `source` is the first_source() dict. Returns (dashboardId, tileId).
-        The v2 tile config uses sourceId + select:[{aggFn, where}] (not the legacy
-        {source, select:"count()", whereLanguage, from, granularity}).
+
+        THE TILE IS BUILT BY `_tile_for`, not inline. It was inline, and when the lookup above was
+        switched to the cached `list_dashboards()` the local `source_id` it depended on went with
+        the old loop — leaving a dangling reference that only fires on the CREATE path, because the
+        lookup returns first for every alert whose dashboard already exists. It reached a cluster as
+        `name 'source_id' is not defined` on the one alert that needed a new dashboard.
+
+        One builder for create and update is what makes that unrepresentable: there is no second
+        copy to leave behind.
         """
         for d in self.list_dashboards():
             if d.get("name") == name and d.get("tiles"):
                 return d["id"], d["tiles"][0]["id"]
-        tile = {
-            "id": "count", "x": 0, "y": 0, "w": 6, "h": 3,
-            "name": name,
-            "config": {
-                "displayType": "line",
-                "sourceId": source_id,
-                "asRatio": False,
-                "fillNulls": True,
-                # whereLanguage:"sql" is load-bearing. HyperDX's external API maps a tile series'
-                # `whereLanguage` to the alert's `aggConditionLanguage`, DEFAULTING TO 'lucene' when
-                # omitted (packages/api/src/utils/externalApi.ts: `aggConditionLanguage: s.whereLanguage ?? 'lucene'`).
-                # Alert `spec.where` is ClickHouse SQL (ResourceAttributes[...], JSONExtractString(Body,...),
-                # ServiceName NOT IN (...)). Without this pin the SQL is parsed as Lucene → it becomes a
-                # full-text search for the words of the query itself (self-matching HyperDX's own echoed
-                # query) and the alert fires on a phantom. Pin it to sql so the filter is evaluated as written.
-                "select": [{"aggFn": "count", "where": where or "", "whereLanguage": "sql"}],
-            },
-        }
-        d = self._req("POST", "/api/v2/dashboards", {"name": name, "tags": [], "tiles": [tile]})
+        d = self._req("POST", "/api/v2/dashboards",
+                      {"name": name, "tags": [], "tiles": [self._tile_for(name, source, where)]})
+        self.invalidate_cache()
         return d["id"], d["tiles"][0]["id"]
 
     def list_alerts(self):
