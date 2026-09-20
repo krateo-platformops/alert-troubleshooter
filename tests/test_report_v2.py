@@ -583,3 +583,55 @@ class TestTautologicalThresholds(unittest.TestCase):
         r._reconcile_cr(Hdx(), {'metadata': {'name': 'bad'}, 'spec': {'threshold': 0, 'thresholdType': 'above'},
                                 'status': {'hyperdxAlertId': 'h1'}}, {'id': 's'}, 'hook')
         self.assertEqual(deleted, [])
+
+
+class TestEnsureDashboardTileCreate(unittest.TestCase):
+    """The CREATE path of ensure_dashboard_tile had NO test, which is exactly how a dangling name
+    reached a cluster: the lookup returns first for every alert whose dashboard already exists, so
+    every existing test walked the early return and the create body was never executed."""
+
+    def _hdx(self, dashboards):
+        import hyperdx_v2
+        h = hyperdx_v2.HyperDXV2.__new__(hyperdx_v2.HyperDXV2)
+        h._dashboards = None
+        h.calls = []
+
+        def fake_req(method, path, body=None):
+            h.calls.append((method, path, body))
+            if method == 'GET' and path == '/api/v2/dashboards':
+                return dashboards
+            return {'id': 'dash-new', 'tiles': [{'id': 'count'}]}
+        h._req = fake_req
+        return h
+
+    def test_CREATES_the_dashboard_when_none_carries_the_name(self):
+        h = self._hdx([])
+        dash, tile = h.ensure_dashboard_tile('krateo-alert-x', {'id': 'src-1'}, "ServiceName = 'x'")
+        self.assertEqual((dash, tile), ('dash-new', 'count'))
+        post = [c for c in h.calls if c[0] == 'POST'][0]
+        cfg = post[2]['tiles'][0]['config']
+        self.assertEqual(cfg['sourceId'], 'src-1')          # the reference that was dangling
+        self.assertEqual(cfg['select'][0]['where'], "ServiceName = 'x'")
+
+    def test_the_created_tile_pins_whereLanguage_sql(self):
+        """Load-bearing: omitted, HyperDX maps the series to aggConditionLanguage 'lucene' and the
+        SQL filter becomes a full-text search that self-matches — the alert fires on a phantom."""
+        h = self._hdx([])
+        h.ensure_dashboard_tile('krateo-alert-x', {'id': 'src-1'}, 'a = 1')
+        post = [c for c in h.calls if c[0] == 'POST'][0]
+        self.assertEqual(post[2]['tiles'][0]['config']['select'][0]['whereLanguage'], 'sql')
+
+    def test_REUSES_an_existing_dashboard_without_posting(self):
+        h = self._hdx([{'id': 'd1', 'name': 'krateo-alert-x', 'tiles': [{'id': 't1'}]}])
+        self.assertEqual(h.ensure_dashboard_tile('krateo-alert-x', {'id': 'src-1'}), ('d1', 't1'))
+        self.assertEqual([c for c in h.calls if c[0] == 'POST'], [])
+
+    def test_create_and_update_build_the_SAME_tile(self):
+        """The property that makes the dangling reference unrepresentable: one builder, both verbs."""
+        h = self._hdx([])
+        h.ensure_dashboard_tile('krateo-alert-x', {'id': 'src-1'}, 'a = 1')
+        created = [c for c in h.calls if c[0] == 'POST'][0][2]['tiles'][0]
+        h2 = self._hdx([])
+        h2.update_dashboard_tile('d1', 'krateo-alert-x', {'id': 'src-1'}, 'a = 1')
+        updated = [c for c in h2.calls if c[0] == 'PUT'][0][2]['tiles'][0]
+        self.assertEqual(created, updated)
