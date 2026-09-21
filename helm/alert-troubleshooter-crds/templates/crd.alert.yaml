@@ -52,11 +52,13 @@ spec:
                   type: string
                   default: ""
                   description: >
-                    ClickHouse SQL filter over the logs source counted by the alert (empty = all
-                    rows) — NOT Lucene, which this field's description claimed until observability#57.
-                    The controller pins whereLanguage:"sql" on the tile; a Lucene-shaped filter is
-                    parsed as SQL, matches nothing, and the alert can never fire.
-                    e.g. ServiceName = 'krateo' AND SeverityNumber >= 17.
+                    ClickHouse SQL boolean expression over the logs source counted by the alert
+                    (empty = all rows). The controller pins whereLanguage:"sql" on the tile, and the
+                    expression reaches the query's WHERE clause verbatim. Severity travels in the
+                    text rather than in a severity column, so predicates read off Body and, for
+                    Kubernetes events, the JSON inside it — e.g.
+                    ResourceAttributes['telemetry.source'] = 'k8s-events' AND
+                    JSONExtractString(Body, 'object', 'reason') = 'BackOff'.
                 interval:
                   type: string
                   enum: ["1m", "5m", "15m", "30m", "1h", "6h", "12h", "1d"]
