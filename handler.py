@@ -353,6 +353,17 @@ def a2a_analyze(prompt, context_id=None):
 
 
 def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False):
+    """The user message carries the INCIDENT; the agent's system prompt carries the METHOD.
+
+    This used to restate the investigation itself — find the rows by Body, add no severity filter,
+    then read the workload's k8s state, do not substitute a louder problem — every line of which
+    the incident-agent system prompt already says, several of them verbatim. Re-teaching it here
+    bought nothing and was re-sent on every turn of the conversation.
+
+    THE COUPLING THIS CREATES: the method now lives in ONE place, so AUTOPILOT_A2A_URL must point
+    at an agent whose prompt carries it (incident-agent does; a bare generalist does not). Point
+    this at a different agent and you must put the method back.
+    """
     # RE-RUNS: the stable per-alert kagent thread makes the agent 'remember' its previous
     # answer and short-circuit ('I already analyzed this') — which parses to NOTHING and
     # starves re-analysis (seen live 2026-07-14: every post-first run returned 0 chars).
@@ -360,33 +371,24 @@ def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False)
     rerun_preamble = ""
     if rerun:
         rerun_preamble = (
-            "RE-ANALYSIS REQUEST: this alert has fired again. Do NOT refer to, summarize, or "
-            "defer to your previous answers in this conversation. Re-verify against the CURRENT "
-            "cluster and telemetry state from scratch, and output the COMPLETE analysis again — "
-            "including the full structured JSON block — as if this were the first request.\n\n"
+            "RE-ANALYSIS REQUEST: this alert has fired again. Do NOT refer to, summarize or defer "
+            "to your previous answers in this conversation. Re-verify against the CURRENT cluster "
+            "and telemetry state, and output the COMPLETE analysis again — including the full "
+            "structured JSON block — as if this were the first request.\n\n"
         )
     scope = ""
     if where:
         scope = (
-            f"\n\nThis alert fired because log records matched the query `{where}`"
-            + (f" (intent: {message})" if message else "")
-            + ". Those SPECIFIC matching logs are what tripped it. ROOT-CAUSE THAT signal:\n"
-            "1. Find the matching logs by their BODY as the query specifies — do NOT additionally "
-            "require a severity level (this pipeline often leaves SeverityText empty, so a severity "
-            "filter will wrongly return nothing) — to see WHICH workload/namespace emits them.\n"
-            "2. Then inspect THAT workload's Kubernetes state directly (k8s_get_resources): pod status "
-            "and recent events — CrashLoopBackOff, OOMKilled, restart counts, connection errors. The "
-            "workload's k8s state is AUTHORITATIVE even when the logs are hard to query.\n"
-            "Diagnose the workload this alert points at. Do NOT substitute a different, louder problem "
-            "elsewhere on the cluster. Only if you can determine NEITHER the matching logs NOR the "
-            "workload's k8s state should you say you cannot find the cause."
+            f"\n\nIt fired on log records matching `{where}`"
+            + (f" — intent: {message}" if message else "")
+            + ". That query is your entry point, and the workload those rows name is what you "
+            "diagnose."
         )
     return rerun_preamble + (
-        f"A HyperDX observability alert \"{alert_name}\" has fired (state {alert_state}) on this "
-        "Krateo PlatformOps cluster." + scope +
-        "\n\nPerform a focused root-cause analysis of what triggered THIS alert: identify the single "
-        "most likely root cause, name the affected composition(s)/component(s), and give concrete, "
-        "ordered remediation steps. Be concise and actionable; use short markdown sections."
+        f'The HyperDX alert "{alert_name}" has fired (state {alert_state}) on this Krateo '
+        "PlatformOps cluster." + scope +
+        "\n\nRoot-cause it: the single most likely cause, the composition or component affected, "
+        "and an ordered remediation plan."
         + report_v2.STRUCTURED_OUTPUT_INSTRUCTIONS
     )
 
