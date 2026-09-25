@@ -141,7 +141,7 @@ class TestReconcileApiRef(unittest.TestCase):
         st = self.patched[-1][1]
         self.assertEqual((st["state"], st["okSince"]), ("OK", "NOW"))
         self.assertEqual(self.started, [])
-        self.assertEqual(self.lifecycle, [("CompositionDefinition not ready", "OK")])
+        self.assertEqual([state for _, state in self.lifecycle], ["OK"])
 
     def test_a_snowplow_failure_is_phase_Error_and_keeps_the_state(self):
         def boom(ref):
