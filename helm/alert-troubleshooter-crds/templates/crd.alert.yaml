@@ -47,7 +47,10 @@ spec:
               properties:
                 displayName:
                   type: string
-                  description: Alert name shown in HyperDX (defaults to metadata.name).
+                  description: >
+                    Human-readable name, shown in the portal and in the RCA prompt (defaults to
+                    metadata.name). It need not be unique: the HyperDX alert is named after
+                    metadata.name, which its webhook carries back to identify this CR.
                 where:
                   type: string
                   default: ""

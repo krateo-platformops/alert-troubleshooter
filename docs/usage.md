@@ -14,5 +14,8 @@ helm install alert-troubleshooter \
   --namespace krateo-system
 ```
 
-Point a HyperDX alert action at `http://alert-troubleshooter.krateo-system:8080/webhook`.
-Reports appear as `TroubleshootingReport` CRs and in the portal Alerts section.
+Apply `Alert` CRs (see [`examples/alerts/`](../examples/alerts/)). The reconciler creates one
+HyperDX alert per CR, named after its `metadata.name`, and the shared webhook that posts to
+`http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook`. A HyperDX alert fires an RCA
+only if its name is an `Alert` CR's `metadata.name`. Reports appear as `TroubleshootingReport` CRs
+and in the portal Alerts section.

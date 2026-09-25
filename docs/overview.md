@@ -17,3 +17,19 @@ is acked 202 immediately; analysis runs in a background thread.
 It lives in `krateo-platformops` (not `krateo-agentiko`) because it is observability
 plumbing keyed on the platform `observability.krateo.io` API group and rendered by the
 portal — it *calls* an agent, it is not one.
+
+## Alert identity
+
+One `Alert` CR is one HyperDX alert, one webhook target and one report, keyed on the CR's
+`metadata.name`. `spec.displayName` is only a label and may repeat.
+
+- The reconciler names each HyperDX alert after its CR's `metadata.name`, on a single-tile
+  dashboard `krateo-alert-<name>` that no other alert evaluates. An alert claimed by several CRs
+  stays with the CR it is named after; the others create their own.
+- HyperDX's webhook template has no alert id. The shared webhook body is
+  `{"alertName":"{{title}}","state":"{{state}}","source":"hyperdx-alert"}`, and the title is a state
+  emoji plus the HyperDX alert name. The reconciler updates an existing webhook whose body differs.
+- The handler strips the emoji and GETs the `Alert` with exactly that name. A title that names no
+  `Alert` runs no RCA, and neither does a resolve (`state: OK`).
+- The report is `report-<metadata.name>` (hash-suffixed past 63 characters). `spec.alertRef` and
+  `spec.alertNamespace` identify the `Alert`; `spec.alertName` holds its `displayName`.

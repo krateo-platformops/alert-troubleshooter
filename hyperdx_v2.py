@@ -13,7 +13,11 @@ API shape notes:
 """
 import requests
 
-DEFAULT_WEBHOOK_BODY = '{"alertName":"{{title}}","state":"ALERT","source":"hyperdx-alert"}'
+# A generic webhook body can use only {{title}}, {{body}}, {{link}}, {{state}}, {{startTime}},
+# {{endTime}} and {{eventId}} (a hash); there is no alert id. {{title}} is a state emoji plus the
+# HyperDX alert name, and the reconciler names each HyperDX alert after its Alert CR's
+# metadata.name, so the title identifies the CR. {{state}} is ALERT on a firing and OK on a resolve.
+DEFAULT_WEBHOOK_BODY = '{"alertName":"{{title}}","state":"{{state}}","source":"hyperdx-alert"}'
 
 
 class HyperDXError(RuntimeError):
@@ -57,21 +61,21 @@ class HyperDXV2:
         return srcs[0]
 
     def ensure_webhook(self, name, target_url, service="generic", description="", body=None):
-        """Ensure a generic webhook named `name` exists with a body template.
+        """Ensure a generic webhook named `name` exists and sends `body`.
 
-        Returns (webhookId, recreated). A pre-existing body-less webhook is deleted and
-        recreated so callers must re-point alerts when recreated is True.
+        Returns (webhookId, created). An existing webhook whose body differs is updated in place
+        (PUT keeps its id, so its alerts keep notifying it). `created` is True only for a new
+        webhook, whose alerts must be re-pointed. The URL is not compared: the API redacts it.
         """
         body = body or DEFAULT_WEBHOOK_BODY
+        doc = {"name": name, "service": service, "url": target_url,
+               "description": description or name, "body": body}
         for w in (self._req("GET", "/api/v2/webhooks") or []):
             if w.get("name") == name:
-                if w.get("body"):
-                    return w["id"], False
-                self._req("DELETE", f"/api/v2/webhooks/{w['id']}")
-                break
-        created = self._req("POST", "/api/v2/webhooks",
-                            {"name": name, "service": service, "url": target_url,
-                             "description": description or name, "body": body})
+                if w.get("body") != body:
+                    self._req("PUT", f"/api/v2/webhooks/{w['id']}", doc)
+                return w["id"], False
+        created = self._req("POST", "/api/v2/webhooks", doc)
         return created["id"], True
 
     def list_dashboards(self):
@@ -90,10 +94,14 @@ class HyperDXV2:
         """Drop the per-cycle cache. The reconcile loop calls this once, before each pass."""
         self._dashboards = None
 
-    def _tile_for(self, name, source, where):
-        """The single count-over-time tile, as both create and update send it."""
+    def _tile_for(self, name, source, where, tile_id="count"):
+        """The single count-over-time tile, as both create and update send it.
+
+        A create mints a new tile id whatever is sent. An update must send the live tile's id: an
+        unknown id makes HyperDX mint a new tile, drop the old one and delete every alert on it.
+        """
         return {
-            "id": "count", "x": 0, "y": 0, "w": 6, "h": 3,
+            "id": tile_id, "x": 0, "y": 0, "w": 6, "h": 3,
             "name": name,
             "config": {
                 "displayType": "line",
@@ -120,22 +128,23 @@ class HyperDXV2:
                 return select.get("where", "")
         return None
 
-    def update_dashboard_tile(self, dashboard_id, name, source, where=""):
-        """PUT the dashboard so its tile evaluates `where`.
+    def update_dashboard_tile(self, dashboard_id, name, source, where="", tile_id="count"):
+        """PUT the dashboard so its tile `tile_id` evaluates `where`.
 
-        The tile keeps its id: the API resolves tiles against the existing ids
-        (`convertExternalTilesToInternal(tiles, existingTileIds)`), so the alert's `tileId` still
-        addresses this tile afterwards. Minting a new id here would leave the alert pointing at a
-        tile that no longer exists, which fails silently — the alert simply never evaluates.
+        `tile_id` is the id the alert evaluates. The API keeps a tile id only if it already exists
+        (`convertExternalTilesToInternal(tiles, existingTileIds)`); any other id replaces the tile,
+        and `cleanupDashboardAlerts` then deletes the alerts on the replaced one.
         """
         self._req("PUT", f"/api/v2/dashboards/{dashboard_id}",
-                  {"name": name, "tags": [], "tiles": [self._tile_for(name, source, where)]})
+                  {"name": name, "tags": [], "tiles": [self._tile_for(name, source, where, tile_id)]})
         self.invalidate_cache()
 
-    def ensure_dashboard_tile(self, name, source, where=""):
+    def ensure_dashboard_tile(self, name, source, where="", taken=()):
         """Ensure a single-tile dashboard `name` with a count-over-time line chart.
 
-        `source` is the first_source() dict. Returns (dashboardId, tileId).
+        `source` is the first_source() dict. A dashboard whose tile id is in `taken` (a tile another
+        alert already evaluates) is not reused, so two alerts never share one `where`.
+        Returns (dashboardId, tileId).
 
         THE TILE IS BUILT BY `_tile_for`, not inline. It was inline, and when the lookup above was
         switched to the cached `list_dashboards()` the local `source_id` it depended on went with
@@ -147,7 +156,7 @@ class HyperDXV2:
         copy to leave behind.
         """
         for d in self.list_dashboards():
-            if d.get("name") == name and d.get("tiles"):
+            if d.get("name") == name and d.get("tiles") and d["tiles"][0]["id"] not in taken:
                 return d["id"], d["tiles"][0]["id"]
         d = self._req("POST", "/api/v2/dashboards",
                       {"name": name, "tags": [], "tiles": [self._tile_for(name, source, where)]})
@@ -183,17 +192,19 @@ class HyperDXV2:
             "message": message or f"{name} threshold crossed — incident-agent will auto-triage.",
         }
 
-    def alert_drift(self, live, **desired):
-        """Which of MUTABLE differ between the live alert and what the CR asks for.
+    def alert_drift(self, live, name=None, **desired):
+        """Which of MUTABLE (and `name`, when given) differ between the live alert and the CR.
 
         Returns a dict of field -> (live, desired); empty means in agreement. Compared as STRINGS:
         the API returns `threshold` as a number and a CR may carry it as either, and `1 != "1"` is
         a drift that would be "corrected" on every single cycle, rewriting the alert forever.
+        `name` also seeds the default message, so an empty `message` compares equal to the live one.
         """
-        body = self._alert_body("", "", "", "", **{k: v for k, v in desired.items() if k in
-                                                   ("interval", "threshold", "threshold_type", "message")})
+        body = self._alert_body(name or "", "", "", "",
+                                **{k: v for k, v in desired.items() if k in
+                                   ("interval", "threshold", "threshold_type", "message")})
         out = {}
-        for field in self.MUTABLE:
+        for field in self.MUTABLE + (("name",) if name is not None else ()):
             want = body[field]
             got = live.get(field)
             if str(got) != str(want):
@@ -211,10 +222,9 @@ class HyperDXV2:
                      interval="5m", threshold=1, threshold_type="above", message=""):
         """Create the tile-based alert, or RECONCILE the one already carrying this name.
 
-        It used to return an existing alert untouched, which made it ensure-EXISTS rather than
-        ensure-AS-SPECIFIED. That is what defeated the obvious operator recovery: clearing
-        `status.hyperdxAlertId` sent the CR back down this path, and it handed back the same stale
-        alert — so there was no way to change a threshold from the Kubernetes side at all.
+        `name` is the Alert CR's metadata.name, unique per namespace, so one name is one CR.
+        An existing alert is brought to the spec rather than returned untouched: clearing
+        `status.hyperdxAlertId` is the operator's way to force a re-sync through this path.
 
         Returns {id, state}.
         """
@@ -222,7 +232,7 @@ class HyperDXV2:
                   "threshold_type": threshold_type, "message": message}
         for a in self.list_alerts():
             if a.get("name") == name:
-                drift = self.alert_drift(a, **fields)
+                drift = self.alert_drift(a, name=name, **fields)
                 if not drift:
                     return {"id": a["id"], "state": a.get("state", "OK")}
                 return self.update_alert(a["id"], name, dashboard_id, tile_id, webhook_id, **fields)

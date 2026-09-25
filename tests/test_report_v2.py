@@ -255,32 +255,35 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertEqual(create["alertNamespace"], "krateo-system")  # defaulted, never empty
         self.assertEqual(create["trigger"], "alert")
 
-    def test_match_alert_matches_emoji_display_name_and_returns_cr(self):
-        """The webhook title carries an emoji the Alert's slug/displayName don't; _match_alert
-        normalizes both sides and returns the whole Alert CR (id + slug come off it)."""
+    def test_match_alert_looks_up_the_exact_name_the_title_carries(self):
+        """The title is a state emoji + the HyperDX alert name, which is the Alert's metadata.name;
+        _match_alert GETs exactly that CR."""
         h = self._handler()
         alert_cr = {"metadata": {"name": "error-log-volume", "namespace": "krateo-system"},
-                    "spec": {"displayName": "Error log volume", "where": "SeverityText:error"},
+                    "spec": {"displayName": "Error log volume"},
                     "status": {"hyperdxAlertId": "6a55c0ba903d2bac4e3615e2", "state": "ALERT"}}
+        paths = []
         orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": {"items": [alert_cr]}
+        h._k8s = lambda method, path, body=None, subresource="": paths.append(path) or alert_cr
         try:
-            m = h._match_alert("🔥 Error log volume", "krateo-system")
+            m = h._match_alert("🚨 error-log-volume", "krateo-system")
         finally:
             h._k8s = orig
-        self.assertIsNotNone(m)
         self.assertEqual(m["metadata"]["name"], "error-log-volume")
-        self.assertEqual(m["status"]["hyperdxAlertId"], "6a55c0ba903d2bac4e3615e2")
+        self.assertEqual(paths, ["/apis/observability.krateo.io/v1alpha1/namespaces/krateo-system"
+                                 "/alerts/error-log-volume"])
 
-    def test_match_alert_returns_none_when_no_alert_matches(self):
+    def test_match_alert_returns_none_when_the_title_is_no_alert_name(self):
+        """A displayName title (spaces, capitals) is not a metadata.name: no lookup, no match."""
         h = self._handler()
+        calls = []
         orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": {"items": [
-            {"metadata": {"name": "cpu-alert"}, "spec": {"displayName": "CPU"}}]}
+        h._k8s = lambda *a, **k: calls.append(a) or {}
         try:
-            self.assertIsNone(h._match_alert("disk pressure", "krateo-system"))
+            self.assertIsNone(h._match_alert("🚨 Pod crash-looping", "krateo-system"))
         finally:
             h._k8s = orig
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
@@ -332,11 +335,11 @@ class TestAlertSpecPush(unittest.TestCase):
             self.tile_reads.append(dash)
             return self._tile_where
 
-        def update_dashboard_tile(self, dash, name, source, where=''):
-            self.tile_puts.append({'dash': dash, 'where': where})
+        def update_dashboard_tile(self, dash, name, source, where='', tile_id='count'):
+            self.tile_puts.append({'dash': dash, 'where': where, 'tile': tile_id})
             self._tile_where = where
 
-        def alert_drift(self, live, **desired):
+        def alert_drift(self, live, name=None, **desired):
             want = {'interval': desired['interval'], 'threshold': desired['threshold'],
                     'thresholdType': desired['threshold_type'], 'message': desired['message']}
             return {k: (live.get(k), v) for k, v in want.items() if str(live.get(k)) != str(v)}
