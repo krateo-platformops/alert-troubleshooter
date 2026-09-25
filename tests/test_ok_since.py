@@ -59,7 +59,7 @@ class TestOkSinceIsWrittenWithState(unittest.TestCase):
                 raise RuntimeError("push failed")
             return {}
 
-        def ensure_dashboard_tile(self, name, source, where=""):
+        def ensure_dashboard_tile(self, name, source, where="", **kw):
             return "d2", "t2"
 
         def ensure_alert(self, name, dash, tile, hook, **fields):
