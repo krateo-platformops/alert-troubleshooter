@@ -9,6 +9,7 @@ docs/overview.md: architecture
 docs/usage.md: install + wire the webhook
 docs/configuration.md: image + runtime env
 docs/api.md: the two CRDs + HTTP surface
+report_v2.py: the RCA output contract; howToFix = {precondition, apply, verify} bash scripts, exit 0 gone / 1 holds / else unknown, all three or none
 docs/examples.md: runnable examples
 docs/release.md: bare-semver build/release
 helm/alert-troubleshooter/: the chart

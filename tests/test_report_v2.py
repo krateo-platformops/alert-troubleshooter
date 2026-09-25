@@ -15,6 +15,20 @@ from report_v2 import parse_structured_report
 
 PROSE = "## Root cause\nThe deployment is crash-looping.\n\n## Remediation\nFix the image tag."
 
+PRECONDITION = (
+    "#!/usr/bin/env bash\n"
+    "# Holds while payment-api runs the missing tag v9.\n"
+    "i=$(kubectl get deployment payment-api -n prod"
+    " -o jsonpath='{.spec.template.spec.containers[?(@.name==\"api\")].image}') || exit 2\n"
+    "[ \"$i\" = payment:v9 ] && exit 1\n"
+    "exit 0\n")
+APPLY = ("#!/usr/bin/env bash\n# Point payment-api back to v8, the last tag the registry serves.\n"
+         "kubectl set image deployment/payment-api api=payment:v8 -n prod\n")
+VERIFY = ("#!/usr/bin/env bash\n# Fixed once payment-api is off v9 and available.\n"
+          "d=$(kubectl get deployment payment-api -n prod -o json) || exit 2\n"
+          "jq -e '.status.availableReplicas == .spec.replicas' <<<\"$d\" >/dev/null\n"
+          "case $? in 0) exit 0 ;; 1) exit 1 ;; *) exit 2 ;; esac\n")
+
 VALID_BLOCK = {
     "analyzedResources": [
         {"gvr": "apps/v1/deployments", "name": "payment-api", "namespace": "prod",
@@ -31,12 +45,7 @@ VALID_BLOCK = {
         {"step": 2, "statement": "Tag v9 does not exist in the registry", "evidenceRefs": [1]},
     ],
     "rootCause": {"statement": "Bad image tag v9", "confidence": 0.85, "category": "image"},
-    "remediationPlan": [
-        {"description": "Point the deployment back to v8", "verb": "patch",
-         "gvr": "apps/v1/deployments", "target": {"name": "payment-api", "namespace": "prod"},
-         "payload": {"spec": {"template": {"spec": {"containers": [{"name": "api", "image": "payment:v8"}]}}}},
-         "successCriterion": "deployment Available=True, restarts stop"},
-    ],
+    "howToFix": {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY},
 }
 
 
@@ -56,11 +65,8 @@ class TestValidV2(unittest.TestCase):
         self.assertEqual(v2["reasoningTrace"][0]["evidenceRefs"], [0, 1])
         self.assertEqual(v2["rootCause"],
                          {"statement": "Bad image tag v9", "category": "image", "confidence": "0.85"})
-        plan = v2["remediationPlan"][0]
-        self.assertEqual(plan["verb"], "patch")
-        self.assertEqual(plan["target"], {"name": "payment-api", "namespace": "prod"})
-        self.assertIn("payload", plan)
-        self.assertEqual(plan["observedOutcome"], "")       # ALWAYS empty pre-apply
+        self.assertEqual(v2["howToFix"],
+                         {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY})
 
     def test_unfenced_json_tag_still_parses(self):
         prose, v2 = parse_structured_report(answer(VALID_BLOCK, fence=""))  # bare ``` fence
@@ -78,11 +84,12 @@ class TestValidV2(unittest.TestCase):
         self.assertEqual(prose, "Bad image tag v9")         # falls back to the root-cause statement
         self.assertTrue(v2)
 
-    def test_observed_outcome_from_agent_is_discarded(self):
+    def test_remediation_plan_is_not_carried(self):
         block = json.loads(json.dumps(VALID_BLOCK))
-        block["remediationPlan"][0]["observedOutcome"] = "I already fixed it"  # it must NOT claim this
+        block["remediationPlan"] = [{"description": "Point the deployment back to v8", "verb": "patch"}]
         _, v2 = parse_structured_report(answer(block))
-        self.assertEqual(v2["remediationPlan"][0]["observedOutcome"], "")
+        self.assertNotIn("remediationPlan", v2)
+        self.assertIn("howToFix", v2)
 
 
 class TestFallbacks(unittest.TestCase):
@@ -108,7 +115,7 @@ class TestFallbacks(unittest.TestCase):
 
     def test_never_raises_on_garbage_shapes(self):
         garbage = {"sources": "not-a-list", "reasoningTrace": {"step": 1}, "rootCause": ["x"],
-                   "remediationPlan": 42, "missingContext": {"a": 1}, "assumptions": [{}],
+                   "howToFix": 42, "missingContext": {"a": 1}, "assumptions": [{}],
                    "analyzedResources": [None, 3, "x"]}
         text = answer(garbage)
         prose, v2 = parse_structured_report(text)
@@ -167,15 +174,76 @@ class TestSanitizers(unittest.TestCase):
         self.assertNotIn("rootCause", v2)
         self.assertEqual(v2["missingContext"], ["kept so the block is non-empty"])
 
-    def test_plan_requires_description_and_dict_payload(self):
-        block = {"remediationPlan": [
-                     {"verb": "delete"},                                   # no description → dropped
-                     {"description": "restart", "payload": "not-a-dict"},  # payload dropped, step kept
-                 ],
-                 "rootCause": {"statement": "x"}}
-        _, v2 = parse_structured_report(answer(block))
-        self.assertEqual(len(v2["remediationPlan"]), 1)
-        self.assertNotIn("payload", v2["remediationPlan"][0])
+
+class TestHowToFix(unittest.TestCase):
+    """status.howToFix: all three scripts or none, never truncated, and a dropped set is said in
+    missingContext when there is a root cause to fix."""
+
+    NOTE = ": the incident has no scripts to check or fix it."
+
+    def _parse(self, how, **extra):
+        block = {"rootCause": {"statement": "x"}, "missingContext": ["gap"],
+                 "sources": [{"type": "object", "ref": "prod/payment-api", "excerpt": "payment:v9"}],
+                 **extra}
+        if how is not ...:
+            block["howToFix"] = how
+        return parse_structured_report(answer(block))[1]
+
+    def test_scripts_are_kept_verbatim_with_one_trailing_newline(self):
+        v2 = self._parse({"precondition": "\n  " + PRECONDITION + "\n\n", "apply": APPLY,
+                          "verify": VERIFY.rstrip("\n")})
+        self.assertEqual(v2["howToFix"],
+                         {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY})
+        self.assertEqual(v2["missingContext"], ["gap"])
+
+    def test_a_partial_set_is_dropped_whole_and_the_report_kept(self):
+        v2 = self._parse({"precondition": PRECONDITION, "apply": APPLY})
+        self.assertNotIn("howToFix", v2)
+        self.assertEqual(v2["rootCause"]["statement"], "x")
+        self.assertEqual(v2["missingContext"], ["gap", "No usable howToFix (verify missing)" + self.NOTE])
+
+    def test_non_string_and_blank_scripts_are_missing(self):
+        v2 = self._parse({"precondition": 42, "apply": {"cmd": "kubectl"}, "verify": "   "})
+        self.assertNotIn("howToFix", v2)
+        self.assertEqual(v2["missingContext"][-1], "No usable howToFix (precondition missing; "
+                                                   "apply missing; verify missing)" + self.NOTE)
+
+    def test_an_over_long_script_is_dropped_never_truncated(self):
+        long_apply = "#!/usr/bin/env bash\n" + "x" * report_v2.SCRIPT_MAX_CHARS
+        v2 = self._parse({"precondition": PRECONDITION, "apply": long_apply, "verify": VERIFY})
+        self.assertNotIn("howToFix", v2)
+        self.assertIn(f"apply over {report_v2.SCRIPT_MAX_CHARS} characters", v2["missingContext"][-1])
+
+    def test_a_list_of_lines_is_joined(self):
+        v2 = self._parse({"precondition": PRECONDITION.splitlines(), "apply": APPLY, "verify": VERIFY})
+        self.assertEqual(v2["howToFix"]["precondition"], PRECONDITION)
+
+    def test_keys_other_than_the_three_scripts_are_dropped(self):
+        v2 = self._parse({"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY,
+                          "description": "roll back"})
+        self.assertEqual(sorted(v2["howToFix"]), ["apply", "precondition", "verify"])
+
+    def test_a_non_object_is_dropped(self):
+        v2 = self._parse("kubectl set image deployment/payment-api api=payment:v8")
+        self.assertNotIn("howToFix", v2)
+        self.assertEqual(v2["missingContext"][-1], "No usable howToFix (not an object)" + self.NOTE)
+
+    def test_an_absent_how_to_fix_is_noted_only_under_a_root_cause(self):
+        self.assertEqual(self._parse(...)["missingContext"][-1],
+                         "No usable howToFix (none returned)" + self.NOTE)
+        _, v2 = parse_structured_report(answer({"missingContext": ["could not read pods"]}))
+        self.assertEqual(v2["missingContext"], ["could not read pods"])
+
+    def test_how_to_fix_alone_is_a_structured_block(self):
+        how = {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY}
+        prose, v2 = parse_structured_report(answer({"howToFix": how}))
+        self.assertEqual(prose, PROSE)
+        self.assertEqual(v2, {"howToFix": how})
+
+    def test_the_handler_writes_and_clears_how_to_fix(self):
+        """The handler sends every V2_STATUS_KEYS key on each run, null when absent."""
+        self.assertIn("howToFix", report_v2.V2_STATUS_KEYS)
+        self.assertNotIn("remediationPlan", report_v2.V2_STATUS_KEYS)
 
 
 class TestHandlerWiring(unittest.TestCase):
@@ -193,6 +261,17 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertIn("MUST be honest", p)
         self.assertIn("0-based indices into \"sources\"", p)
         self.assertTrue(p.rstrip().endswith("no trailing commas)."))
+
+    def test_prompt_carries_the_how_to_fix_contract(self):
+        p = self._handler().build_prompt("err-logs", "ALERT", where="body:ERROR")
+        self.assertIn('"howToFix": {"precondition"', p)
+        self.assertIn("0 = the incident is gone, 1 = it still holds", p)
+        self.assertIn("MUST exit 1 then", p)
+        self.assertIn("TEST THE ROOT-CAUSE OBJECT, NEVER THE ALERT'S SIGNAL", p)
+        self.assertIn("killed after 60 seconds", p)
+        self.assertIn("how to fix it.", p)
+        self.assertNotIn("remediationPlan", p)
+        self.assertNotIn("remediation plan", p)
 
     def test_upsert_sets_trigger_alert_on_create_and_patch(self):
         h = self._handler()
@@ -303,7 +382,10 @@ class TestYamlThenJsonFixture(unittest.TestCase):
         prose, v2 = report_v2.parse_structured_report(raw)
         self.assertTrue(v2, "structured block must parse")
         self.assertTrue((v2.get("rootCause") or {}).get("statement"))
-        self.assertTrue(v2.get("remediationPlan"))
+        # the reply carries a remediationPlan and no howToFix
+        self.assertNotIn("remediationPlan", v2)
+        self.assertNotIn("howToFix", v2)
+        self.assertTrue(v2["missingContext"][-1].startswith("No usable howToFix (none returned)"))
         # the yaml example stays in the prose; the json block is stripped
         self.assertIn("```yaml", prose)
         self.assertNotIn('"remediationPlan"', prose)

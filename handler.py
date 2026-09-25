@@ -412,7 +412,7 @@ def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False,
         f'The {source} "{alert_name}" has fired (state {alert_state}) on this Krateo '
         "PlatformOps cluster." + scope +
         "\n\nRoot-cause it: the single most likely cause, the composition or component affected, "
-        "and an ordered remediation plan."
+        "and how to fix it."
         + report_v2.STRUCTURED_OUTPUT_INSTRUCTIONS
     )
 
