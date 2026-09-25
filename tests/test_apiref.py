@@ -152,7 +152,15 @@ class TestReconcileApiRef(unittest.TestCase):
         self.assertEqual(st["phase"], "Error")
         self.assertIn("403", st["error"])
         self.assertNotIn("state", st)
+        self.assertNotIn("value", st)
         self.assertEqual(self.started, [])
+
+    def test_the_RESTAction_value_is_written_with_the_state(self):
+        self.r._reconcile_apiref(_alert(status={"state": "OK"}))
+        self.assertEqual(self.patched[-1][1]["value"], 2)
+        self.status = {"value": 0.5}
+        self.r._reconcile_apiref(_alert(status={"state": "ALERT"}))
+        self.assertEqual((self.patched[-1][1]["state"], self.patched[-1][1]["value"]), ("OK", 0.5))
 
     def test_not_due_means_no_call(self):
         recent = datetime.now(timezone.utc).isoformat()
@@ -239,6 +247,16 @@ class TestReconcileOnceWithApiRef(unittest.TestCase):
         self.assertEqual(sorted(hdx.deleted), [("alert", "h-old"), ("dashboard", "d-old")])
         self.assertIn(("switched", {"hyperdxAlertId": None, "hyperdxDashboardId": None}),
                       self.patched)
+
+    def test_a_where_alert_has_no_value(self):
+        where = {"metadata": {"name": "logs"},
+                 "spec": {"where": "w", "interval": "5m", "threshold": 1, "thresholdType": "above"},
+                 "status": {"value": 3}}
+        self.r._list_alert_crs = lambda: [where]
+        self.r.reconcile_once(self.Hdx())
+        st = [st for name, st in self.patched if name == "logs" and "state" in st][-1]
+        self.assertIn("value", st)
+        self.assertIsNone(st["value"])
 
 
 class TestPrompt(unittest.TestCase):

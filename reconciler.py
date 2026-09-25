@@ -282,14 +282,14 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
             # AND MUST NOT CLAIM Synced. `phase` used to say Synced unconditionally here; saying it
             # while the spec sits unpushed is what cost an afternoon to find, because the status
             # actively asserted the opposite of the truth.
-            _patch_status(name, {"state": st, "okSince": _ok_since(status, st),
+            _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "value": None,
                                  "phase": "SpecDrift", "error": str(e)[:300],
                                  "lastSyncedAt": _now()})
             print(f"[reconciler] Alert {name}: spec push failed, phase=SpecDrift ({e})", flush=True)
             _reconcile_report_lifecycle(display, st)
             return
-        _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "phase": "Synced",
-                             "lastSyncedAt": _now()})
+        _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "value": None,
+                             "phase": "Synced", "lastSyncedAt": _now()})
         if changed:
             print(f"[reconciler] Alert {name}: pushed {', '.join(changed)} to hyperdx {hdx_id}", flush=True)
         _reconcile_report_lifecycle(display, st)
@@ -304,8 +304,8 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
                              message=spec.get("message", ""))
     st = alert.get("state", "OK")
     _patch_status(name, {"hyperdxAlertId": alert["id"], "hyperdxDashboardId": dash_id,
-                         "state": st, "okSince": _ok_since(status, st), "phase": "Synced",
-                         "lastSyncedAt": _now()})
+                         "state": st, "okSince": _ok_since(status, st), "value": None,
+                         "phase": "Synced", "lastSyncedAt": _now()})
     _reconcile_report_lifecycle(display, st)
     print(f"[reconciler] synced Alert {name} -> hyperdx {alert['id']} ({st})", flush=True)
 
@@ -347,8 +347,8 @@ def _reconcile_apiref(cr):
               f"failed ({e})", flush=True)
         return
     st = "ALERT" if apiref.exceeds(value, threshold, kind) else "OK"
-    _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "phase": "Synced",
-                         "error": None, "lastSyncedAt": _now()})
+    _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "value": value,
+                         "phase": "Synced", "error": None, "lastSyncedAt": _now()})
     _reconcile_report_lifecycle(display, st)
     if st == "ALERT":
         _start_analysis(alert_name=display, alert_state=st, alert_ns=NAMESPACE,

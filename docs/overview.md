@@ -36,7 +36,8 @@ RESTAction), enforced by a CEL rule. For an apiRef alert the reconciler itself p
 2. The RESTAction's filter returns `{value: N, items?: [...]}`. `value` is compared with
    `threshold` using HyperDX's `thresholdType` semantics; `between`/`not_between` are `Invalid`
    (no `thresholdMax`). The row-count tautology check does not apply.
-3. `state` and `okSince` are written like a HyperDX alert's. On ALERT the same RCA path as a
+3. `state` and `okSince` are written like a HyperDX alert's, and `status.value` holds the
+   RESTAction's number (display only; a `where` alert has none). On ALERT the same RCA path as a
    webhook runs, with `items` in the prompt, under the same report cooldown.
 
 HyperDX is not involved, and apiRef alerts are evaluated before the HyperDX pass, so a HyperDX

@@ -121,6 +121,12 @@ spec:
                   description: >
                     When the alert last turned OK; unset while state is anything but OK. Written
                     by the loop that writes state, for display only: it never closes an incident.
+                value:
+                  type: number
+                  nullable: true
+                  description: >
+                    The number an apiRef alert's RESTAction returned at its last evaluation, the
+                    one compared with threshold; unset for a where alert. For display only.
                 phase:
                   type: string
                   description: >
