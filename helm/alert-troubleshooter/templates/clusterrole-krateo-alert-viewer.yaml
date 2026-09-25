@@ -1,0 +1,12 @@
+# krateo-alert-viewer — read access to Alerts for people, not for this controller. The portal
+# reads Alerts with the signed-in user's own token, so a user who should see them needs
+# get/list/watch on alerts.observability.krateo.io. The chart ships the role with no binding and no
+# aggregation labels: an admin decides who sees alerts by binding it to groups (docs/usage.md).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: krateo-alert-viewer
+rules:
+  - apiGroups: ["observability.krateo.io"]
+    resources: ["alerts"]
+    verbs: ["get", "list", "watch"]
