@@ -12,7 +12,6 @@ T0 = "2026-09-25T10:31:00+00:00"
 def _reconciler():
     r = importlib.reload(importlib.import_module("reconciler"))
     r._now = lambda: "NOW"
-    r._reconcile_report_lifecycle = lambda *a, **k: None
     return r
 
 

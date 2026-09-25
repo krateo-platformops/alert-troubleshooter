@@ -1,12 +1,13 @@
-"""TroubleshootingReport v2 — the structured-investigation contract with the Autopilot agent.
+"""The Incident's structured-investigation contract with the RCA agent (incident-agent).
 
 Owns BOTH sides of the contract so they can't drift:
   * STRUCTURED_OUTPUT_INSTRUCTIONS — appended to the RCA prompt; requires the agent to end its
     answer with ONE fenced ```json block matching the v2 status fields.
-  * parse_structured_report(text) — defensively extracts + sanitizes that block into the CR's
-    status fields. NEVER raises: any malformed/missing JSON degrades to a prose-only (v1) report.
+  * parse_structured_report(text) — defensively extracts + sanitizes that block into the
+    Incident's status fields. NEVER raises: any malformed/missing JSON degrades to a prose-only
+    (v1) report.
 
-Sanitizing rules (defensive, latest-run-wins):
+Sanitizing rules (defensive):
   * unknown keys are dropped; wrong-typed values are coerced when safe, else dropped;
   * sources[].type outside the enum falls back to "object" (evidence is kept, never lost);
   * reasoningTrace[].evidenceRefs are validated against len(sources): out-of-bounds/non-int
@@ -24,13 +25,12 @@ import re
 
 TRIGGERS = ("alert", "composition-condition", "user-ask")
 SOURCE_TYPES = ("logs", "events", "metrics", "object")
-LIFECYCLES = ("open", "mitigated", "resolved")
 
-# Every v2 key the handler writes under .status. The Ready patch always carries ALL of them
-# (parsed value or None→JSON null, which merge-patch DELETES) so a re-run that fails to produce
-# structure also clears the previous run's structure — no stale mixed-run investigation.
+# Every parsed key the handler writes under the Incident's .status. parse_structured_report also
+# returns `evidence` (the retrieval ledger behind the confidence cap), which the Incident does not
+# store: its operator-facing sentence is already in the prose and missingContext.
 V2_STATUS_KEYS = ("analyzedResources", "sources", "missingContext", "assumptions",
-                  "reasoningTrace", "rootCause", "howToFix", "evidence")
+                  "reasoningTrace", "rootCause", "howToFix")
 
 # status.howToFix: bash scripts. The incident controller runs precondition and verify in a
 # read-only sandbox (exit 0 = the incident is gone, 1 = it holds, anything else = unknown); a human
@@ -661,7 +661,7 @@ def _candidate_blocks(text):
             data = json.loads(span.body)
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(data, dict) and any(k in data for k in V2_STATUS_KEYS + ("rootCause",)):
+        if isinstance(data, dict) and any(k in data for k in V2_STATUS_KEYS):
             yield span, data
 
 
@@ -715,6 +715,6 @@ def parse_structured_report(text, tool_ledger=None):
             return prose, v2
     except Exception:  # noqa: BLE001 — the structured block is best-effort, never fatal
         pass
-    # FALLBACK STAYS BYTE-IDENTICAL. handler.py keep-last-good keys off `not prose and not v2`;
-    # a banner here would make an empty A2A reply look like a result and overwrite a good report.
+    # FALLBACK STAYS BYTE-IDENTICAL. handler.run_analysis tells an empty answer by `not prose and
+    # not v2`; a banner here would make an empty A2A reply look like a result.
     return text, {}

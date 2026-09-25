@@ -1,4 +1,4 @@
-"""Exact Alert identity: one Alert CR is one HyperDX alert, one report, one webhook target.
+"""Exact Alert identity: one Alert CR is one HyperDX alert, one webhook target, its own incidents.
 
 The HyperDX side runs the real HyperDXV2 client against an in-memory API that keeps the two
 behaviours these bugs hinge on: a dashboard PUT keeps a tile id only if it already exists, and
@@ -12,11 +12,13 @@ import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import requests  # noqa: E402
 
 import handler  # noqa: E402
 import hyperdx_v2  # noqa: E402
+from fake_k8s import FakeK8s  # noqa: E402
 
 DISPLAY = "Krateo — composition reconcile errors"
 K, S = "krateo-composition-reconcile-error", "sre-krateo-composition-reconcile-error"
@@ -125,7 +127,6 @@ class ReconcilerHarness:
         self.r._list_alert_crs = lambda: copy.deepcopy(list(self.crs.values()))
         self.r._patch_status = self._patch_status
         self.r._patch_finalizers = lambda name, fins: None
-        self.r._reconcile_report_lifecycle = lambda *a, **k: None
 
     def _patch_status(self, name, status):
         st = self.crs[name].setdefault("status", {})
@@ -274,41 +275,9 @@ class TestWebhookTemplate(unittest.TestCase):
         self.assertEqual(api.webhooks[wid]["body"], hyperdx_v2.DEFAULT_WEBHOOK_BODY)
 
 
-class FakeK8s:
-    """The apiserver calls handler.process makes: Alert GETs, report GET/POST/PATCH."""
-
-    def __init__(self, alerts):
-        self.alerts = {a["metadata"]["name"]: a for a in alerts}
-        self.reports, self.calls = {}, []
-
-    def __call__(self, method, path, body=None, subresource=""):
-        self.calls.append((method, path))
-        tail = path.rsplit("/", 2)
-        if "/alerts/" in path and method == "GET":
-            if tail[-1] not in self.alerts:
-                raise _http_error(404)
-            return copy.deepcopy(self.alerts[tail[-1]])
-        if "/troubleshootingreports" in path:
-            if method == "POST":
-                self.reports[body["metadata"]["name"]] = copy.deepcopy(body)
-                return body
-            name = tail[-1]
-            if method == "GET":
-                if name not in self.reports:
-                    raise _http_error(404)
-                return copy.deepcopy(self.reports[name])
-            if method == "PATCH":
-                if subresource == "status":
-                    self.reports[name].setdefault("status", {}).update(body["status"])
-                else:
-                    self.reports[name]["spec"].update(body.get("spec") or {})
-                return {}
-        raise AssertionError(f"unexpected {method} {path}")
-
-
 class TestWebhookMapsToItsOwnCR(unittest.TestCase):
-    """Bugs #3 and #4: a substring match tied a webhook to the wrong Alert, and the report was
-    named after the displayName, so same-named Alerts shared one report."""
+    """Bugs #3 and #4: a substring match tied a webhook to the wrong Alert, and same-named Alerts
+    shared one record. Each Alert now labels its own incidents."""
 
     def setUp(self):
         self.k8s = FakeK8s([
@@ -327,54 +296,37 @@ class TestWebhookMapsToItsOwnCR(unittest.TestCase):
     def tearDown(self):
         handler._k8s, handler.a2a_analyze = self._orig
 
-    def test_two_same_displayName_alerts_get_two_reports(self):
+    def incidents(self):
+        return {o["spec"]["alertRef"]["name"]: o for o in self.k8s.incidents.values()}
+
+    def test_two_same_displayName_alerts_get_two_incidents(self):
         handler.process({"alertName": f"🚨 {K}", "state": "ALERT"})
         handler.process({"alertName": f"🚨 {S}", "state": "ALERT"})
-        self.assertEqual(sorted(self.k8s.reports), [f"report-{K}", f"report-{S}"])
-        for name, hid, where in ((K, "hk", "where-k"), (S, "hs", "where-s")):
-            spec = self.k8s.reports[f"report-{name}"]["spec"]
-            self.assertEqual(spec["alertRef"], name)
-            self.assertEqual(spec["hyperdxAlertId"], hid)
-            self.assertEqual(spec["alertName"], DISPLAY)
-            self.assertIn(f"`{where}`", spec["prompt"])
+        got = self.incidents()
+        self.assertEqual(sorted(got), [K, S])
+        for name, where in ((K, "where-k"), (S, "where-s")):
+            self.assertEqual(got[name]["metadata"]["labels"],
+                             {"observability.krateo.io/alert": name})
+            self.assertIn(f"`{where}`", got[name]["spec"]["prompt"])
+            self.assertIn(DISPLAY, got[name]["spec"]["prompt"])
         self.assertNotEqual(self.prompts[0][1], self.prompts[1][1])  # two kagent threads
 
     def test_a_title_maps_to_the_exact_alert_not_one_containing_it(self):
         handler.process({"alertName": "🚨 sre-pod-crashloop", "state": "ALERT"})
-        spec = self.k8s.reports["report-sre-pod-crashloop"]["spec"]
-        self.assertEqual(spec["alertRef"], "sre-pod-crashloop")
-        self.assertIn("`where-cluster`", spec["prompt"])
-        self.assertNotIn("report-krateo-platform-crashloop", self.k8s.reports)
+        got = self.incidents()
+        self.assertEqual(sorted(got), ["sre-pod-crashloop"])
+        self.assertIn("`where-cluster`", got["sre-pod-crashloop"]["spec"]["prompt"])
 
     def test_a_title_naming_no_alert_runs_no_rca(self):
         """A displayName title (a HyperDX alert not yet renamed) names no CR: no scope, no RCA."""
         handler.process({"alertName": "🚨 Pod crash-looping", "state": "ALERT"})
-        self.assertEqual(self.k8s.reports, {})
+        self.assertEqual(self.k8s.incidents, {})
         self.assertEqual(self.prompts, [])
 
     def test_a_resolve_notification_runs_no_rca(self):
         handler.process({"alertName": f"✅ {K}", "state": "OK"})
-        self.assertEqual(self.k8s.reports, {})
+        self.assertEqual(self.k8s.incidents, {})
         self.assertEqual(self.k8s.calls, [])
-
-
-class TestReportName(unittest.TestCase):
-    def test_the_report_is_named_after_the_alert(self):
-        self.assertEqual(handler._report_name(K), f"report-{K}")
-
-    def test_long_names_with_a_common_prefix_get_two_reports(self):
-        a, b = "x" * 60 + "-first", "x" * 60 + "-second"
-        ra, rb = handler._report_name(a), handler._report_name(b)
-        self.assertNotEqual(ra, rb)
-        self.assertLessEqual(max(len(ra), len(rb)), 63)
-        self.assertRegex(ra, r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
-
-    def test_the_lifecycle_reads_the_report_of_that_exact_alert(self):
-        r = importlib.reload(importlib.import_module("reconciler"))
-        asked = []
-        r._get_report = lambda ns, name: asked.append(name) or None
-        r._reconcile_report_lifecycle(S, "OK")
-        self.assertEqual(asked, [f"report-{S}"])
 
 
 if __name__ == "__main__":

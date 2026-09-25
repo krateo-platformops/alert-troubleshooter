@@ -1,14 +1,16 @@
 # alert-troubleshooter
-Observability plumbing (krateo-platformops): a HyperDX alert webhook -> krateo-autopilot A2A
-root-cause analysis -> TroubleshootingReport CR (observability.krateo.io/v1alpha1) the portal
-renders. It calls an agent; it is not one.
-Identity: one Alert CR = one HyperDX alert named after its metadata.name = one report
-report-<metadata.name>. The webhook title carries that name; the handler looks the Alert up exactly.
+Observability plumbing (krateo-platformops): an Alert firing (HyperDX webhook or apiRef) -> an
+Incident (observability.krateo.io/v1alpha1, incident-controller's CRD) with an incident-agent A2A
+root-cause analysis. It calls an agent; it is not one.
+Identity: one Alert CR = one HyperDX alert named after its metadata.name; its incidents carry the
+label observability.krateo.io/alert=<metadata.name>. The webhook title carries that name.
+Policy A: at most one open incident per alert; a firing on it does firings++, else a new
+<alert>-<yyyymmdd-hhmmss> opens (Analyzing -> RCA -> Open, error set when it has no howToFix).
 
 docs/overview.md: architecture
 docs/usage.md: install + wire the webhook
 docs/configuration.md: image + runtime env
-docs/api.md: the two CRDs + HTTP surface
+docs/api.md: the Alert CRD, the Incident fields written, HTTP surface
 report_v2.py: the RCA output contract; howToFix = {precondition, apply, verify} bash scripts, exit 0 gone / 1 holds / else unknown, all three or none
 docs/examples.md: runnable examples
 docs/release.md: bare-semver build/release

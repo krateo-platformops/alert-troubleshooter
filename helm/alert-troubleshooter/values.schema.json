@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema",
   "title": "Alert Troubleshooter",
-  "description": "Bridges a HyperDX observability alert to an incident-agent root-cause analysis, written back as a TroubleshootingReport CR the portal renders.",
+  "description": "Turns each firing of an observability Alert into an Incident with an incident-agent root-cause analysis and its how-to-fix scripts.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -93,12 +93,6 @@
           "title": "HyperDX API URL",
           "description": "HyperDX v2 external API the reconciler pushes Alert CRs to (Bearer auth). Defaults to the krateo-clickstack-api Service.",
           "default": "http://krateo-clickstack-api.krateo-system.svc:8000"
-        },
-        "reportCooldown": {
-          "type": "integer",
-          "title": "Report cooldown (s)",
-          "description": "Dedup window in seconds: don't re-analyze the same alert within this.",
-          "default": 1800
         },
         "reconcileInterval": {
           "type": "integer",

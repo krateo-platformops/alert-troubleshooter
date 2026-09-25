@@ -1,7 +1,7 @@
 ---
 type: Component
 title: alert-troubleshooter
-description: HyperDX alert -> autopilot root-cause -> TroubleshootingReport CR, rendered in the portal.
+description: An Alert's firing -> an Incident with an incident-agent root-cause analysis, rendered in the portal.
 tags: [observability, alerts]
 timestamp: 2026-08-20T00:00:00Z
 ---

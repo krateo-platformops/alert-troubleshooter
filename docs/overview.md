@@ -1,18 +1,18 @@
 ---
 type: Architecture
 title: alert-troubleshooter — architecture
-description: How a HyperDX alert becomes an autopilot-authored TroubleshootingReport the portal renders.
+description: How an alert firing becomes an Incident with an incident-agent root-cause analysis, one open incident per alert.
 tags: [observability, alerts, autopilot]
 timestamp: 2026-08-20T00:00:00Z
 ---
 
 # alert-troubleshooter
 
-A webhook receiver + controller (not an agent): on a HyperDX alert-fired `POST /webhook` it
-creates a `TroubleshootingReport` CR (`observability.krateo.io/v1alpha1`, phase `Analyzing`),
-calls the **krateo-autopilot** A2A agent for a root-cause analysis, and patches the CR status
-(`phase: Ready`, `report: <markdown>`) which the portal Alerts section renders. The webhook
-is acked 202 immediately; analysis runs in a background thread.
+A webhook receiver + controller (not an agent). Each firing of an `Alert`, a HyperDX webhook
+(`POST /webhook`) or an apiRef alert the reconciler evaluates, is recorded on an `Incident`
+(`observability.krateo.io/v1alpha1`, the CRD incident-controller ships): the alert's open incident
+counts it, or a new incident opens and **incident-agent** root-causes it over A2A. The webhook is
+acked 202 immediately; the analysis runs in a background thread.
 
 It lives in `krateo-platformops` (not `krateo-agentiko`) because it is observability
 plumbing keyed on the platform `observability.krateo.io` API group and rendered by the
@@ -20,7 +20,7 @@ portal — it *calls* an agent, it is not one.
 
 ## Alert identity
 
-One `Alert` CR is one HyperDX alert, one webhook target and one report, keyed on the CR's
+One `Alert` CR is one HyperDX alert, one webhook target and its own incidents, keyed on the CR's
 `metadata.name`. `spec.displayName` is only a label and may repeat.
 
 - The reconciler names each HyperDX alert after its CR's `metadata.name`, on a single-tile
@@ -31,8 +31,33 @@ One `Alert` CR is one HyperDX alert, one webhook target and one report, keyed on
   emoji plus the HyperDX alert name. The reconciler updates an existing webhook whose body differs.
 - The handler strips the emoji and GETs the `Alert` with exactly that name. A title that names no
   `Alert` runs no RCA, and neither does a resolve (`state: OK`).
-- The report is `report-<metadata.name>` (hash-suffixed past 63 characters). `spec.alertRef` and
-  `spec.alertNamespace` identify the `Alert`; `spec.alertName` holds its `displayName`.
+- Its incidents carry the label `observability.krateo.io/alert: <metadata.name>` and
+  `spec.alertRef {name, namespace}`. A name over 63 characters cannot be a label value, so such an
+  `Alert` opens no incident.
+
+## Incidents
+
+An alert has at most one open incident (Policy A); an incident is open in any state but
+`Resolved` and `Closed`. For each firing, `handler.analyze`:
+
+1. lists the Incidents in the Alert's namespace labelled with the Alert's name;
+2. if one is open, adds one to its `status.firings`, sets `status.lastFiredAt`, and runs no RCA.
+   The incident controller writes the same status, so the write is conditioned on the
+   resourceVersion it read and retried on a conflict;
+3. otherwise creates `<alert>-<yyyymmdd-hhmmss>` (the firing's UTC time) with the label and
+   `spec.alertRef`, `trigger: alert`, `prompt` and `triggeredAt`, in state `Analyzing` with
+   `firings: 1`;
+4. runs the RCA on the incident's own kagent thread (contextId = uuid5 of its name), then writes
+   the analysis, `howToFix` and `state: Open` in one status write.
+
+- An RCA that fails, or whose answer is empty, unstructured or has no usable `howToFix`, still
+  opens the incident, with `status.error` saying why it has no scripts.
+- An incident a human closed while it was analyzing stays `Closed`, which is final: the analysis
+  is written without a state.
+- At startup the handler opens every incident a restart left `Analyzing`, with the reason in
+  `error`, so it can be closed and the next firing opens a fresh one.
+- The alert returning to OK changes nothing. From `Open` on, the incident controller runs its
+  scripts and moves it, or a human closes it.
 
 ## Alert status
 
@@ -53,8 +78,8 @@ RESTAction), enforced by a CEL rule. For an apiRef alert the reconciler itself p
    `threshold` using HyperDX's `thresholdType` semantics; `between`/`not_between` are `Invalid`
    (no `thresholdMax`). The row-count tautology check does not apply.
 3. `state` and `okSince` are written like a HyperDX alert's, and `status.value` holds the
-   RESTAction's number (display only; a `where` alert has none). On ALERT the same RCA path as a
-   webhook runs, with `items` in the prompt, under the same report cooldown.
+   RESTAction's number (display only; a `where` alert has none). An ALERT evaluation is a firing,
+   recorded like a webhook's; a new incident's prompt carries `items`.
 
 HyperDX is not involved, and apiRef alerts are evaluated before the HyperDX pass, so a HyperDX
 outage does not stop them. HyperDX objects left from when a CR used `where` are deleted. The

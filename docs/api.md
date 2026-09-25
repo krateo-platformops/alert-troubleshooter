@@ -1,7 +1,7 @@
 ---
 type: API
 title: API
-description: The two CRDs this controller owns.
+description: The Alert CRD this controller owns, the Incident fields it writes, the RCA output contract and the HTTP surface.
 tags: [observability, alerts]
 timestamp: 2026-08-20T00:00:00Z
 ---
@@ -9,7 +9,7 @@ timestamp: 2026-08-20T00:00:00Z
 # API
 
 - **`Alert`** (`observability.krateo.io/v1alpha1`) — the inbound alert shape (see `crds/crd.alert.yaml`). Exactly one of `spec.where` (HyperDX row count) or `spec.apiRef {name, namespace}` (a RESTAction whose filter returns `{value: N, items?: [...]}`, polled every `spec.interval`). `status.state` mirrors HyperDX or the RESTAction's value; `status.okSince` is when it last turned OK, unset while it is anything else; `status.value` is the number an apiRef alert's RESTAction last returned, unset for a `where` alert (both display only).
-- **`TroubleshootingReport`** (`observability.krateo.io/v1alpha1`) — `status.phase` (`Analyzing`/`Ready`) + `status.report` markdown (see `crds/crd.troubleshootingreport.yaml`). One per `Alert`, named `report-<Alert metadata.name>`; `spec.alertRef`/`spec.alertNamespace` name the `Alert`.
+- **`Incident`** (`observability.krateo.io/v1alpha1`) — written here, owned by incident-controller, whose chart ships the CRD. The handler creates `<alert>-<yyyymmdd-hhmmss>` with the label `observability.krateo.io/alert` and `spec.alertRef`, `trigger`, `prompt`, `triggeredAt`, and writes status `state` (`Analyzing`, then `Open`), `firings`, `lastFiredAt`, `howToFix`, `error`, `completedAt` and the analysis fields below. See [overview](overview.md#incidents).
 
 HTTP: `POST /webhook` (acked 202); `GET /healthz`. The webhook body is
 `{"alertName":"<emoji> <Alert metadata.name>","state":"ALERT|OK","source":"hyperdx-alert"}`, the
@@ -40,5 +40,6 @@ The parser keeps `howToFix` only when all three scripts are non-empty strings of
 characters (a list of lines is joined). Otherwise it drops `howToFix` whole, keeps the rest of the
 report and, when there is a root cause, appends to `missingContext` why there are no scripts.
 
-`TroubleshootingReport` has no `howToFix` field, so the apiserver prunes it; the `Incident` CRD
-(incident-controller) stores it. The handler does not write `status.remediationPlan`.
+The handler writes the `V2_STATUS_KEYS` onto the Incident. The parser's `evidence` (the
+retrieval ledger behind the confidence cap) is not stored; its sentence is already in the report
+and `missingContext`.

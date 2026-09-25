@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""krateo-alert-troubleshooter — bridges a HyperDX alert webhook to an Autopilot root-cause analysis.
+"""krateo-alert-troubleshooter — turns an alert firing into an Incident with a root-cause analysis.
 
-On POST /webhook (HyperDX alert-fired payload):
-  1. create a TroubleshootingReport CR (phase=Analyzing) via the apiserver,
-  2. call the krateo-autopilot A2A agent (JSON-RPC message/stream) with a troubleshooting prompt,
-  3. accumulate the streamed analysis and patch the CR status (phase=Ready, report=<markdown>).
-
-Runs anyone's-browser-independent: this is the "background" path. Minimal deps: stdlib + requests.
+Both triggers, a HyperDX webhook (process) and an apiRef alert the reconciler evaluates, call
+analyze(), which applies Policy A:
+  * the alert has an open Incident (any state but Resolved and Closed): count the firing on it;
+  * it has none: create one in state Analyzing, run the incident-agent RCA over A2A, and write the
+    analysis with its howToFix scripts in state Open.
+From Open on, the incident controller runs the scripts and moves the Incident. Stdlib + requests.
 """
 import base64
-import hashlib
 import json
 import os
 import re
@@ -18,35 +17,26 @@ import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 
 import requests
 
-import report_v2  # the structured-report (v2) contract: prompt instructions + defensive parser
+import report_v2  # the structured-report contract: prompt instructions + defensive parser
 
 # --- config (env, with in-cluster defaults) ---
 NAMESPACE = os.environ.get("NAMESPACE", "krateo-system")
 AUTOPILOT_A2A = os.environ.get("AUTOPILOT_A2A_URL", "http://krateo-autopilot.krateo-system.svc:8080/")
 APISERVER = os.environ.get("APISERVER", "https://kubernetes.default.svc")
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
-GROUP, VERSION, PLURAL = "observability.krateo.io", "v1alpha1", "troubleshootingreports"
+GROUP, VERSION = "observability.krateo.io", "v1alpha1"
 A2A_TIMEOUT = int(os.environ.get("A2A_TIMEOUT", "180"))
-# HyperDX notifies every eval while an alert stays breached; dedup so we don't spam a new report
-# each interval. Skip if one for the same alert is in-flight, or was created within this window.
-REPORT_COOLDOWN = int(os.environ.get("REPORT_COOLDOWN", "1800"))
-# The per-alert kagent A2A thread is continued (same contextId) across re-runs for rail/deep-link
-# continuity, but each re-run forces a COMPLETE fresh RCA (build_prompt rerun=True) that re-pulls ALL
-# telemetry (logs + k8s dumps) into that ONE thread. Over many fires the thread's accumulated
-# tool-call history grows without bound and eventually overflows the model's input-token window
-# (seen live 2026-07-16: 95 runs on one thread -> 1,097,807 tokens > Gemini's 1,048,576 limit -> the
-# provider 400s and the RCA can no longer run at all). So the thread is ROTATED every
-# CONTEXT_MAX_RUNS runs: the contextId is keyed on a run-count "epoch", so after this many runs a
-# fresh empty thread opens and the accumulated context resets. Continuity is preserved within a
-# window; no analysis quality is lost across a rotation because the next run re-derives everything
-# from scratch anyway. At a conservative ~15k tokens of telemetry per run, 10 runs ~= 150k tokens --
-# an order of magnitude under the limit, with ample headroom for a verbose run.
-CONTEXT_MAX_RUNS = max(1, int(os.environ.get("CONTEXT_MAX_RUNS", "10")))
 # How much of an apiRef alert's `items` goes into the RCA prompt.
 ITEMS_PROMPT_CHARS = 4000
+
+# The Incident contract (incident-controller apis/incident/v1alpha1).
+LABEL_ALERT = "observability.krateo.io/alert"  # value: the Alert's metadata.name, so at most 63 chars
+ENDED = ("Resolved", "Closed")                 # an incident in any other state is open
+WRITE_ATTEMPTS = 5                             # conditioned status writes retried on a 409
 
 # Intra-service auth (Option A). The alert->RCA pipeline is autonomous — it carries NO user JWT —
 # but incident-agent's MCP tools sit behind agentgateway, whose authz allows /mcp only with a valid
@@ -60,7 +50,7 @@ ITEMS_PROMPT_CHARS = 4000
 AUTHN_URL = os.environ.get("AUTHN_URL", "").rstrip("/")
 AUTHN_TOKEN_FILE = os.environ.get("AUTHN_TOKEN_FILE", "/var/run/secrets/authn/token")
 
-_create_lock = threading.Lock()  # serialize the dedup-check + create so simultaneous fires don't race
+_create_lock = threading.Lock()  # one firing at a time finds-or-creates, so two cannot both open one
 _jwt_cache = {"token": "", "exp": 0.0}
 _jwt_lock = threading.Lock()  # serialize the token exchange so concurrent fires reuse one JWT
 
@@ -117,122 +107,130 @@ def _k8s(method, path, body=None, subresource=""):
     return r.json()
 
 
-RUN_COUNT_ANNO = "observability.krateo.io/run-count"
-FIRST_RUN_ANNO = "observability.krateo.io/first-run-at"
-LAST_RUN_ANNO = "observability.krateo.io/last-run-at"
-CONTEXT_ID_ANNO = "observability.krateo.io/context-id"
+def _http_status(e):
+    return getattr(getattr(e, "response", None), "status_code", None)
 
 
-def _report_name(alert_name):
-    """One DETERMINISTIC report CR per Alert CR (upserted): `report-<Alert metadata.name>`, so a
-    re-firing alert bumps a run-count on the SAME report and two Alerts never share one.
-
-    Past 63 characters the name is cut and suffixed with a hash of the whole Alert name, so two
-    long names with a common prefix still get two reports."""
-    name = f"report-{alert_name}"
-    if len(name) <= 63:
-        return name
-    digest = hashlib.sha256(alert_name.encode()).hexdigest()[:8]
-    return f"{name[:54].rstrip('-.')}-{digest}"
+def _incidents(ns, name=""):
+    path = f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/incidents"
+    return f"{path}/{name}" if name else path
 
 
-def _context_id(report_name, run_count=0):
-    """A DETERMINISTIC A2A contextId per report (uuid5 of the report name + a run-count epoch),
-    so RCA runs of the SAME alert continue ONE kagent conversation thread for rail/deep-link
-    continuity — but that thread is ROTATED every CONTEXT_MAX_RUNS runs so its accumulated telemetry
-    can never overflow the model's input-token window. Two DIFFERENT alerts get two distinct threads;
-    the same alert gets a fresh thread each epoch. Deterministic + stable across restarts (the epoch
-    is derived from the report's persisted run-count, not from process state).
-
-    run_count is the count of THIS run (1-based). Epoch = (run_count - 1) // CONTEXT_MAX_RUNS, so
-    runs 1..N share epoch 0, runs N+1..2N share epoch 1, etc. — each epoch a clean, empty thread."""
-    epoch = max(0, (int(run_count) - 1)) // CONTEXT_MAX_RUNS
-    seed = report_name if epoch == 0 else f"{report_name}#e{epoch}"
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
+def incident_name(alert_ref, at):
+    """`<alert>-<yyyymmdd-hhmmss>` of the opening firing, in UTC."""
+    return f"{alert_ref}-{at.strftime('%Y%m%d-%H%M%S')}"
 
 
-def _get_report(ns, name):
+def _context_id(name):
+    """The incident's own kagent thread: every RCA starts from an empty conversation."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
+
+
+def _open_incident(ns, alert_ref):
+    """The alert's open Incident, the newest if there are several, or None."""
+    selector = quote(f"{LABEL_ALERT}={alert_ref}", safe="")
+    items = _k8s("GET", f"{_incidents(ns)}?labelSelector={selector}").get("items") or []
+    open_ = [i for i in items if (i.get("status") or {}).get("state") not in ENDED]
+    return max(open_, default=None,
+               key=lambda i: (i["metadata"].get("creationTimestamp", ""), i["metadata"]["name"]))
+
+
+def _patch_status(ns, incident, status):
+    """Merge `status` into the Incident's status, conditioned on the resourceVersion it was read
+    at: the controller writes the same status, so a 409 means re-read and retry."""
+    body = {"metadata": {"resourceVersion": incident["metadata"]["resourceVersion"]},
+            "status": status}
+    return _k8s("PATCH", _incidents(ns, incident["metadata"]["name"]), body, subresource="status")
+
+
+def _count_firing(ns, incident, now):
+    """firings++ and lastFiredAt on an open incident. False on a lost race (409)."""
+    firings = int((incident.get("status") or {}).get("firings") or 0)
     try:
-        return _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}")
+        _patch_status(ns, incident, {"firings": firings + 1, "lastFiredAt": now})
+        return True
     except requests.HTTPError as e:
-        if getattr(getattr(e, "response", None), "status_code", None) == 404:
-            return None
+        if _http_status(e) == 409:
+            return False
         raise
 
 
-def _next_run_count(existing):
-    """The 1-based count of the run about to start: previous run-count + 1, or 1 for a first-ever
-    report. Kept consistent with the increment in _upsert_report so the rotated contextId's epoch
-    matches the run-count the report is stamped with."""
-    if existing is None:
-        return 1
-    anns = (existing.get("metadata") or {}).get("annotations") or {}
-    try:
-        return int(anns.get(RUN_COUNT_ANNO, "0")) + 1
-    except (ValueError, TypeError):
-        return 1
+def _open_or_count(ns, alert_ref, prompt, at):
+    """Policy A for one firing: count it on the alert's open incident, or create one.
 
-
-def _upsert_report(ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
-                   context_id="", alert_ref="", alert_namespace=""):
-    """Create the alert's report (run-count=1) or bump the existing one (run-count++, last-run=now),
-    setting phase=Analyzing. Run info + the per-alert kagent context id live in annotations — no
-    TroubleshootingReport CRD change.
-
-    The join keys (hyperdxAlertId / alertRef / alertNamespace) are sourced from the MATCHED Alert CR
-    (not the unreliable webhook payload) so the portal can join incident→alert by a robust HyperDX id
-    or a deterministic /alerts/{ns}/{name} slug — never the fragile emoji displayName. They're set on
-    every run (create AND patch), since a first run may not have found the Alert yet."""
-    join = {"alertState": alert_state or "ALERT", "trigger": "alert", "triggeredAt": now}
-    if alert_id:
-        join["hyperdxAlertId"] = alert_id          # robust ID join to the Alert's status.hyperdxAlertId
-    if alert_ref:
-        join["alertRef"] = alert_ref               # the Alert's metadata.name slug → /alerts/{ns}/{name}
-    if alert_namespace:
-        join["alertNamespace"] = alert_namespace   # the Alert CR's real namespace (not just the report's)
-    if existing is None:
-        body = {
-            "apiVersion": f"{GROUP}/{VERSION}", "kind": "TroubleshootingReport",
-            "metadata": {"name": name,
-                         "annotations": {RUN_COUNT_ANNO: "1", FIRST_RUN_ANNO: now, LAST_RUN_ANNO: now,
-                                         CONTEXT_ID_ANNO: context_id}},
-            "spec": ({"alertName": alert_name or "",
-                      # default alertNamespace to the report's ns; a matched Alert overrides below
-                      "alertNamespace": ns, "prompt": prompt} | join),
-        }
-        _k8s("POST", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}", body)
-    else:
-        anns = (existing.get("metadata") or {}).get("annotations") or {}
+    Returns the new Incident, or None when the firing was counted on an open one."""
+    now = at.isoformat()
+    name = incident_name(alert_ref, at)
+    for _ in range(WRITE_ATTEMPTS):
+        open_ = _open_incident(ns, alert_ref)
+        if open_ is not None:
+            if _count_firing(ns, open_, now):
+                print(f"[incident] {ns}/{open_['metadata']['name']}: firing counted", flush=True)
+                return None
+            continue
+        body = {"apiVersion": f"{GROUP}/{VERSION}", "kind": "Incident",
+                "metadata": {"name": name, "namespace": ns, "labels": {LABEL_ALERT: alert_ref}},
+                "spec": {"alertRef": {"name": alert_ref, "namespace": ns}, "trigger": "alert",
+                         "prompt": prompt, "triggeredAt": now}}
         try:
-            count = int(anns.get(RUN_COUNT_ANNO, "0")) + 1
-        except (ValueError, TypeError):
-            count = 1
-        _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}",
-             {"metadata": {"annotations": {RUN_COUNT_ANNO: str(count), LAST_RUN_ANNO: now,
-                                           CONTEXT_ID_ANNO: context_id}},
-              "spec": join})
-    patch_status(ns, name, {"phase": "Analyzing"})
+            created = _k8s("POST", _incidents(ns), body)
+        except requests.HTTPError as e:
+            if _http_status(e) == 409:  # a concurrent firing created it: count on it instead
+                continue
+            raise
+        # Unconditioned: the controller may already have touched the new object, and no other
+        # writer sets these fields yet.
+        _k8s("PATCH", _incidents(ns, name),
+             {"status": {"state": "Analyzing", "firings": 1, "lastFiredAt": now}},
+             subresource="status")
+        print(f"[incident] {ns}/{name}: opened", flush=True)
+        return created
+    raise RuntimeError(f"alert {ns}/{alert_ref}: no incident write succeeded in "
+                       f"{WRITE_ATTEMPTS} attempts")
 
 
-def patch_status(ns, name, status):
-    _k8s("PATCH", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/{PLURAL}/{name}", {"status": status}, subresource="status")
+def _finish(ns, name, status):
+    """Write the analysis. An incident still Analyzing becomes Open; in any other state (a human
+    closed it, or applied a fix, while it was analyzing) the analysis is written without a state,
+    since Closed is final and the controller owns the rest."""
+    for _ in range(WRITE_ATTEMPTS):
+        incident = _k8s("GET", _incidents(ns, name))
+        body = dict(status)
+        if (incident.get("status") or {}).get("state") in (None, "Analyzing"):
+            body["state"] = "Open"
+        try:
+            _patch_status(ns, incident, body)
+            return
+        except requests.HTTPError as e:
+            if _http_status(e) != 409:
+                raise
+    raise RuntimeError(f"incident {ns}/{name}: no status write succeeded in {WRITE_ATTEMPTS} attempts")
 
 
-def _within_cooldown(report):
-    """Dedup: True if this alert's report is mid-analysis, or was last run within REPORT_COOLDOWN —
-    so a perpetually-breached alert re-analyzes at most once per window (bumping its run-count then)."""
-    if not report:
-        return False
-    if ((report.get("status") or {}).get("phase")) in ("Pending", "Analyzing"):
-        return True
-    anns = (report.get("metadata") or {}).get("annotations") or {}
-    ts = anns.get(LAST_RUN_ANNO) or (report.get("metadata") or {}).get("creationTimestamp")
+INTERRUPTED = "The analysis was interrupted: the troubleshooter restarted before it finished."
+
+
+def recover_interrupted(ns=NAMESPACE):
+    """Open every incident a restart left Analyzing (or before its first status write), with the
+    reason in `error`.
+
+    An Analyzing incident is open, so it would count every later firing of its alert and never be
+    checked. Open, it can be closed, and the next firing opens a fresh one. An analysis still
+    running in another replica overwrites `error` when it finishes."""
     try:
-        if ts and (datetime.now(timezone.utc) - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() < REPORT_COOLDOWN:
-            return True
-    except (ValueError, AttributeError):
-        pass
-    return False
+        items = _k8s("GET", f"{_incidents(ns)}?labelSelector={quote(LABEL_ALERT, safe='')}")
+    except Exception as e:  # noqa: BLE001 — no Incident CRD yet, or no apiserver: nothing to recover
+        print(f"[incident] recovery skipped ({e})", flush=True)
+        return
+    for incident in items.get("items") or []:
+        if (incident.get("status") or {}).get("state") not in (None, "Analyzing"):
+            continue
+        try:
+            _patch_status(ns, incident, {"state": "Open", "error": INTERRUPTED})
+            print(f"[incident] {ns}/{incident['metadata']['name']}: interrupted, opened", flush=True)
+        except Exception as e:  # noqa: BLE001 — a 409 means another writer moved it
+            print(f"[incident] {ns}/{incident['metadata']['name']}: recovery skipped ({e})",
+                  flush=True)
 
 
 # A DNS-1123 subdomain: what an Alert CR's metadata.name, and so its HyperDX alert's name, can be.
@@ -359,30 +357,13 @@ def a2a_analyze(prompt, context_id=None):
     return out.strip(), ledger
 
 
-def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False, api=None):
+def build_prompt(alert_name, alert_state, where=None, message=None, api=None):
     """The user message carries the INCIDENT; the agent's system prompt carries the METHOD.
 
-    This used to restate the investigation itself — find the rows by Body, add no severity filter,
-    then read the workload's k8s state, do not substitute a louder problem — every line of which
-    the incident-agent system prompt already says, several of them verbatim. Re-teaching it here
-    bought nothing and was re-sent on every turn of the conversation.
-
-    THE COUPLING THIS CREATES: the method now lives in ONE place, so AUTOPILOT_A2A_URL must point
-    at an agent whose prompt carries it (incident-agent does; a bare generalist does not). Point
-    this at a different agent and you must put the method back.
+    THE COUPLING THIS CREATES: the method lives in ONE place, so AUTOPILOT_A2A_URL must point at an
+    agent whose prompt carries it (incident-agent does; a bare generalist does not). Point this at a
+    different agent and you must put the method back.
     """
-    # RE-RUNS: the stable per-alert kagent thread makes the agent 'remember' its previous
-    # answer and short-circuit ('I already analyzed this') — which parses to NOTHING and
-    # starves re-analysis (seen live 2026-07-14: every post-first run returned 0 chars).
-    # Force a complete fresh pass while keeping the thread (rail continuity).
-    rerun_preamble = ""
-    if rerun:
-        rerun_preamble = (
-            "RE-ANALYSIS REQUEST: this alert has fired again. Do NOT refer to, summarize or defer "
-            "to your previous answers in this conversation. Re-verify against the CURRENT cluster "
-            "and telemetry state, and output the COMPLETE analysis again — including the full "
-            "structured JSON block — as if this were the first request.\n\n"
-        )
     scope = ""
     if where:
         scope = (
@@ -408,7 +389,7 @@ def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False,
                 shown = shown[:ITEMS_PROMPT_CHARS] + " …(truncated)"
             scope += (" The objects it matched are your entry point, and they are what you "
                       f"diagnose:\n{shown}")
-    return rerun_preamble + (
+    return (
         f'The {source} "{alert_name}" has fired (state {alert_state}) on this Krateo '
         "PlatformOps cluster." + scope +
         "\n\nRoot-cause it: the single most likely cause, the composition or component affected, "
@@ -427,84 +408,78 @@ def process(payload):
     if alert_state == "OK":
         print(f"[webhook] {title!r} resolved; nothing to analyze", flush=True)
         return
-    # The fired Alert CR scopes the RCA (spec.where/message) and carries the join keys the report
-    # needs (status.hyperdxAlertId + metadata.name/namespace). Without one there is no scope, so
-    # no RCA runs.
+    # The fired Alert CR scopes the RCA (spec.where/message) and names the incident
+    # (metadata.name/namespace). Without one there is no scope, so nothing is recorded.
     matched = _match_alert(title, alert_ns)
     if matched is None:
         print(f"[webhook] {title!r} names no Alert in {alert_ns}; skipping", flush=True)
         return
     m_spec = matched.get("spec") or {}
     m_meta = matched.get("metadata") or {}
-    m_status = matched.get("status") or {}
     where, message = m_spec.get("where"), m_spec.get("message")
-    alert_id = m_status.get("hyperdxAlertId") or ""          # ID join → Alert.status.hyperdxAlertId
     alert_ref = m_meta.get("name", "")                        # exact key → /alerts/{ns}/{name}
     alert_namespace = m_meta.get("namespace") or alert_ns     # the Alert CR's real namespace
-    display = m_spec.get("displayName") or alert_ref
-    analyze(display, alert_state, alert_ns, where=where, message=message, alert_id=alert_id,
-            alert_ref=alert_ref, alert_namespace=alert_namespace)
+    analyze(m_spec.get("displayName") or alert_ref, alert_state, alert_ref, alert_namespace,
+            where=where, message=message)
 
 
-def analyze(alert_name, alert_state, alert_ns, where=None, message=None, alert_id="",
-            alert_ref="", alert_namespace="", api=None):
-    """Run the RCA for one firing of an alert and write it to that alert's report.
+def analyze(alert_name, alert_state, alert_ref, alert_namespace, where=None, message=None,
+            api=None):
+    """One firing of an alert, through Policy A.
 
-    Both entry points call it: the HyperDX webhook (process) and the evaluation of an apiRef
-    alert (reconciler), which passes `api` = {name, namespace, value, threshold, thresholdType,
-    items}. `alert_name` is the displayName, `alert_ref` the Alert's metadata.name. A firing
-    inside the report's cooldown, or while it is still analyzing, is skipped.
+    Both triggers call it: the HyperDX webhook (process) and the evaluation of an apiRef alert
+    (reconciler), which passes `api` = {name, namespace, value, threshold, thresholdType, items}.
+    `alert_name` is the displayName, `alert_ref` the Alert's metadata.name; the incident lives in
+    the Alert's namespace. A firing on an open incident is counted on it and runs no RCA.
     """
-    prompt = None  # built after the dedup gate, when we know if this is a re-run
-    name = _report_name(alert_ref)
-    now = _now()
-    # One report CR per alert, upserted under a lock: re-fires within the cooldown are skipped;
-    # otherwise the same CR is re-analyzed and its run-count bumped — no pile-up of duplicate reports.
-    with _create_lock:
-        existing = _get_report(alert_ns, name)
-        if _within_cooldown(existing):
-            print(f"[dedup] {alert_ref!r} analyzed recently / in-flight; skipping", flush=True)
-            return
-        # THIS run's 1-based count = previous run-count + 1 (1 for a first-ever report). The kagent
-        # thread is keyed on it so the thread rotates every CONTEXT_MAX_RUNS runs — bounding the
-        # accumulated telemetry well under the model's input-token limit.
-        run_count = _next_run_count(existing)
-        ctx = _context_id(name, run_count)  # per-report thread, rotated every CONTEXT_MAX_RUNS
-        prompt = build_prompt(alert_name, alert_state, where, message, rerun=bool(existing),
-                              api=api)
-        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
-                       ctx, alert_ref=alert_ref, alert_namespace=alert_namespace)
+    if len(alert_ref) > 63:
+        print(f"[incident] alert {alert_ref!r}: a name over 63 characters cannot label an "
+              "Incident; skipping", flush=True)
+        return
+    ns = alert_namespace
+    prompt = build_prompt(alert_name, alert_state, where, message, api=api)
     try:
-        raw, tool_ledger = a2a_analyze(prompt, ctx)
-        # v2: split the answer into prose + the structured investigation. Parsing is defensive —
-        # a missing/malformed JSON block degrades to a prose-only (v1) report, never a crash.
-        print(f"[a2a] raw reply: {len(raw)} chars, {len(tool_ledger)} tool results", flush=True)
+        with _create_lock:
+            created = _open_or_count(ns, alert_ref, prompt, datetime.now(timezone.utc))
+    except Exception as e:  # noqa: BLE001 — a failed write loses this firing, not the next one
+        print(f"[err] alert {ns}/{alert_ref}: firing not recorded ({e})", flush=True)
+        return
+    if created is not None:
+        run_analysis(ns, created["metadata"]["name"], prompt)
+
+
+def run_analysis(ns, name, prompt):
+    """The RCA of a new incident, then its one status write: the analysis and state Open.
+
+    `error` says why an incident has no howToFix: the call failed, the answer was empty or
+    unstructured, or its scripts were unusable. It is cleared when howToFix is written."""
+    status = {}
+    try:
+        raw, tool_ledger = a2a_analyze(prompt, _context_id(name))
+        print(f"[a2a] {ns}/{name}: {len(raw)} chars, {len(tool_ledger)} tool results", flush=True)
         prose, v2 = report_v2.parse_structured_report(raw, tool_ledger)
-        # KEEP-LAST-GOOD: an EMPTY analysis (no prose AND no structure) is a FAILED run, not a
-        # result — never let it overwrite a previous good investigation (seen live 2026-07-14:
-        # an empty A2A reply wiped a full structured RCA to "Autopilot returned no analysis").
-        # Record the failed re-run on the CR without touching report/v2 fields.
-        if not prose.strip() and not v2:
-            existing_now = _get_report(alert_ns, name) or {}
-            had_analysis = bool(((existing_now.get("status") or {}).get("report") or "").strip()) \
-                or bool((existing_now.get("status") or {}).get("rootCause"))
-            if had_analysis:
-                patch_status(alert_ns, name, {"phase": "Ready",
-                                              "error": f"re-analysis at {_now()} returned no output; kept previous analysis"})
-                print(f"[warn] report {alert_ns}/{name}: empty analysis — kept previous (keep-last-good)", flush=True)
-                return
-        status = {"phase": "Ready", "report": prose or "_Autopilot returned no analysis._",
-                  "completedAt": _now(), "lifecycle": "open", "auditRecordRefs": []}
-        # Latest-run-wins: ALWAYS send every v2 key — parsed value, or None (JSON null, which
-        # merge-patch DELETES) so a re-run that lost structure also clears the stale previous one.
-        for k in report_v2.V2_STATUS_KEYS:
-            status[k] = v2.get(k)
-        patch_status(alert_ns, name, status)
-        print(f"[ok] report {alert_ns}/{name} ready ({len(prose)} chars prose, "
-              f"structured={'yes' if v2 else 'no'})", flush=True)
-    except Exception as e:  # noqa: BLE001 — record the failure on the CR
-        patch_status(alert_ns, name, {"phase": "Failed", "error": str(e)[:500], "completedAt": _now()})
-        print(f"[err] report {alert_ns}/{name} failed: {e}", flush=True)
+        if prose.strip():
+            status["report"] = prose
+        status.update({k: v2[k] for k in report_v2.V2_STATUS_KEYS if k in v2})
+        if "howToFix" in v2:
+            status["error"] = None
+        elif not prose.strip() and not v2:
+            status["error"] = "The analysis returned no output."
+        elif not v2:
+            status["error"] = ("The analysis returned no structured block, so the incident has no "
+                               "scripts to check or fix it.")
+        else:
+            status["error"] = ("The analysis returned no usable howToFix, so the incident has no "
+                               "scripts to check or fix it.")
+    except Exception as e:  # noqa: BLE001 — a failed RCA still opens the incident
+        status["error"] = f"The analysis failed: {str(e)[:500]}"
+    status["completedAt"] = _now()
+    try:
+        _finish(ns, name, status)
+        print(f"[ok] incident {ns}/{name}: analysis written "
+              f"(howToFix={'yes' if status.get('howToFix') else 'no'})", flush=True)
+    except Exception as e:  # noqa: BLE001 — recover_interrupted opens it after a restart
+        print(f"[err] incident {ns}/{name}: analysis not written ({e})", flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -532,16 +507,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Before any firing can open an incident, so only incidents a previous process left are swept.
+    recover_interrupted()
     # Background: reconcile Alert CRs -> HyperDX (config + status) via the session API.
     if os.environ.get("RECONCILER_ENABLED", "true").lower() == "true":
         import reconciler  # imported here so the webhook path has no hard dep on it
         threading.Thread(target=reconciler.run_forever, daemon=True).start()
-    # Background: observe AuditRecords -> fill each applied remediation step's observedOutcome +
-    # auditRecordRefs, closing the remediation loop (the portal flips a step to "applied" on a
-    # non-empty observedOutcome). Correct-but-dormant when provenance isn't enabled / no records flow.
-    if os.environ.get("OBSERVER_ENABLED", "true").lower() == "true":
-        import observer  # imported here so the webhook path has no hard dep on it
-        threading.Thread(target=observer.run_forever, daemon=True).start()
     port = int(os.environ.get("PORT", "8080"))
     print(f"krateo-alert-troubleshooter listening on :{port} → A2A {AUTOPILOT_A2A}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

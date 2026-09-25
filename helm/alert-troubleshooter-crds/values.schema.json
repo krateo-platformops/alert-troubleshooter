@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema",
   "type": "object",
   "title": "Alert Troubleshooter CRDs",
-  "description": "Dedicated CRD chart for alert-troubleshooter (Alert + TroubleshootingReport). Golden rule: CRDs in a separate chart with a separate lifecycle. No tunable values.",
+  "description": "Dedicated CRD chart for alert-troubleshooter (Alert). Golden rule: CRDs in a separate chart with a separate lifecycle. No tunable values.",
   "additionalProperties": false,
   "properties": {
     "global": {

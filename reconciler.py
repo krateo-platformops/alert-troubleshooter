@@ -6,7 +6,7 @@ Runs as a background thread in the krateo-alert-troubleshooter process:
   every RECONCILE_INTERVAL seconds:
     for each apiRef Alert CR (spec.apiRef), when spec.interval has elapsed:
         resolve its RESTAction via snowplow, compare status.value with the threshold, write state;
-        on ALERT start the webhook's RCA path (apiref.py)
+        on ALERT record a firing through the webhook's path, handler.analyze (apiref.py)
     ensure the shared webhook (-> this troubleshooter's /webhook) ->
     for each `where` Alert CR:
         being deleted (deletionTimestamp) -> delete its HyperDX alert+dashboard, drop the finalizer
@@ -18,7 +18,7 @@ Each HyperDX alert is named after its CR's metadata.name, and the webhook title 
 back to the handler, which looks the CR up by it.
 
 Alerts flow: HyperDX evaluates the alert; when it fires it POSTs the webhook -> this service's
-/webhook -> Autopilot RCA -> TroubleshootingReport. The reconciler only manages config + status.
+/webhook -> an Incident with an RCA (handler.analyze). The reconciler only manages config + status.
 
 Auth: HYPERDX_ACCESS_KEY (user.accessKey from hyperdx-api-token Secret, written by the bootstrap
 Job). Calls go to HYPERDX_API_URL (krateo-clickstack-api.krateo-system.svc:8000, port 8000 =
@@ -34,34 +34,10 @@ import requests
 import apiref
 import handler
 import hyperdx_v2
-from handler import _get_report, _k8s, _now, _report_name, patch_status  # reuse the apiserver helpers
+from handler import _k8s, _now  # reuse the apiserver helpers
 
 GROUP, VERSION, PLURAL = "observability.krateo.io", "v1alpha1", "alerts"
 NAMESPACE = os.environ.get("NAMESPACE", "krateo-system")
-
-
-def _reconcile_report_lifecycle(alert_name, state):
-    """Advance the incident report's lifecycle from the triggering alert's live state:
-      - a user-set spec.lifecycle is mirrored to status.lifecycle (the portal's manual Resolve), and
-      - an alert that has returned to OK auto-resolves its still-open report (-> resolved).
-    `alert_name` is the Alert CR's metadata.name, the key the report is named on.
-    Level-based and idempotent — a no-op when there is no report for this alert or nothing changes.
-    Never raises into the reconcile loop."""
-    if not alert_name:
-        return
-    name = _report_name(alert_name)
-    try:
-        rep = _get_report(NAMESPACE, name)
-        if not rep:
-            return
-        spec_lc = ((rep.get("spec") or {}).get("lifecycle") or "").strip()
-        cur_lc = ((rep.get("status") or {}).get("lifecycle") or "open")
-        desired = spec_lc or ("resolved" if (state == "OK" and cur_lc == "open") else cur_lc)
-        if desired and desired != cur_lc:
-            patch_status(NAMESPACE, name, {"lifecycle": desired})
-            print(f"[reconciler] report {name} lifecycle {cur_lc} -> {desired}", flush=True)
-    except Exception as e:  # noqa: BLE001 — lifecycle bookkeeping must never break alert sync
-        print(f"[reconciler] report {name} lifecycle reconcile skipped ({e})", flush=True)
 INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "60"))
 WEBHOOK_NAME = os.environ.get("WEBHOOK_NAME", "krateo-autopilot")
 WEBHOOK_TARGET = os.environ.get(
@@ -302,13 +278,11 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
                                  "phase": "SpecDrift", "error": str(e)[:300],
                                  "lastSyncedAt": _now()})
             print(f"[reconciler] Alert {name}: spec push failed, phase=SpecDrift ({e})", flush=True)
-            _reconcile_report_lifecycle(name, st)
             return
         _patch_status(name, {**ids, "state": st, "okSince": _ok_since(status, st), "value": None,
                              "phase": "Synced", "lastSyncedAt": _now()})
         if changed:
             print(f"[reconciler] Alert {name}: pushed {', '.join(changed)} to hyperdx {alert['id']}", flush=True)
-        _reconcile_report_lifecycle(name, st)
         return
 
     # create: dashboard-tile then an alert on it named after this CR. A tile another alert already
@@ -325,7 +299,6 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
     _patch_status(name, {"hyperdxAlertId": alert["id"], "hyperdxDashboardId": dash_id,
                          "state": st, "okSince": _ok_since(status, st), "value": None,
                          "phase": "Synced", "lastSyncedAt": _now()})
-    _reconcile_report_lifecycle(name, st)
     print(f"[reconciler] synced Alert {name} -> hyperdx {alert['id']} ({st})", flush=True)
 
 
@@ -364,7 +337,8 @@ def _api_ref(cr):
 
 
 def _start_analysis(**kwargs):
-    """The webhook's RCA path (handler.analyze), off the reconcile thread: an RCA takes minutes."""
+    """The webhook's firing path (handler.analyze), off the reconcile thread: a new incident's RCA
+    takes minutes."""
     threading.Thread(target=handler.analyze, kwargs=kwargs, daemon=True).start()
 
 
@@ -372,8 +346,8 @@ def _reconcile_apiref(cr):
     """Evaluate an apiRef alert when it is due (every `spec.interval`).
 
     Snowplow resolves the RESTAction; its `value` is compared with the threshold. `state` and
-    `okSince` are written like a HyperDX alert's, and an ALERT starts the same RCA a webhook
-    starts, with the RESTAction's `items` in the prompt. No HyperDX object is involved, and the
+    `okSince` are written like a HyperDX alert's, and an ALERT is a firing, recorded like a
+    webhook's, with the RESTAction's `items` in the prompt of a new incident. No HyperDX object is involved, and the
     row-count tautology check does not apply: a RESTAction's value may be any number.
     """
     meta, spec, status = cr["metadata"], cr.get("spec", {}), cr.get("status", {})
@@ -398,11 +372,10 @@ def _reconcile_apiref(cr):
     st = "ALERT" if apiref.exceeds(value, threshold, kind) else "OK"
     _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "value": value,
                          "phase": "Synced", "error": None, "lastSyncedAt": _now()})
-    _reconcile_report_lifecycle(name, st)
     if st == "ALERT":
-        _start_analysis(alert_name=display, alert_state=st, alert_ns=NAMESPACE,
-                        message=spec.get("message"), alert_ref=name,
+        _start_analysis(alert_name=display, alert_state=st, alert_ref=name,
                         alert_namespace=meta.get("namespace") or NAMESPACE,
+                        message=spec.get("message"),
                         api={"name": ref.get("name"), "namespace": ref.get("namespace"),
                              "value": value, "threshold": threshold, "thresholdType": kind,
                              "items": out.get("items")})

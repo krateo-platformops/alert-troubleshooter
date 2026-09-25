@@ -1,7 +1,7 @@
 ---
 type: Usage
 title: Install and use
-description: Install the chart, point HyperDX alerts at the webhook, read reports in the portal.
+description: Install the chart, point HyperDX alerts at the webhook, read incidents in the portal.
 tags: [observability, alerts]
 timestamp: 2026-08-20T00:00:00Z
 ---
@@ -17,5 +17,5 @@ helm install alert-troubleshooter \
 Apply `Alert` CRs (see [`examples/alerts/`](../examples/alerts/)). The reconciler creates one
 HyperDX alert per CR, named after its `metadata.name`, and the shared webhook that posts to
 `http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook`. A HyperDX alert fires an RCA
-only if its name is an `Alert` CR's `metadata.name`. Reports appear as `TroubleshootingReport` CRs
-and in the portal Alerts section.
+only if its name is an `Alert` CR's `metadata.name`. Each firing is recorded on an `Incident`, so
+incident-controller's CRD chart must be installed first; without it a firing is logged and lost.

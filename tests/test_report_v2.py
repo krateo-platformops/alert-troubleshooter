@@ -1,4 +1,4 @@
-"""Unit tests for the TroubleshootingReport v2 structured-report contract (report_v2.py)
+"""Unit tests for the Incident's structured-report contract (report_v2.py)
 plus the thin handler-side wiring. Stdlib unittest; no cluster, no network.
 
 Run from the repo root:  python3 -m unittest discover -s tests -v
@@ -247,7 +247,7 @@ class TestHowToFix(unittest.TestCase):
 
 
 class TestHandlerWiring(unittest.TestCase):
-    """The thin handler-side pieces: prompt carries the contract; the CR gets trigger=alert."""
+    """The thin handler-side pieces: the prompt carries the contract; the webhook finds its Alert."""
 
     def _handler(self):
         import handler  # imports requests; safe — the server only starts under __main__
@@ -272,67 +272,6 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertIn("how to fix it.", p)
         self.assertNotIn("remediationPlan", p)
         self.assertNotIn("remediation plan", p)
-
-    def test_upsert_sets_trigger_alert_on_create_and_patch(self):
-        h = self._handler()
-        calls = []
-        orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
-        try:
-            h._upsert_report("ns", "report-x", "x", "ALERT", "id", "prompt", "now", existing=None)
-            h._upsert_report("ns", "report-x", "x", "ALERT", "id", "prompt", "now",
-                             existing={"metadata": {"annotations": {}}})
-        finally:
-            h._k8s = orig
-        create = next(b for m, b in calls if m == "POST")
-        patch = next(b for m, b in calls if m == "PATCH" and b and "spec" in b)
-        self.assertEqual(create["spec"]["trigger"], "alert")
-        self.assertEqual(patch["spec"]["trigger"], "alert")
-
-    def test_upsert_populates_robust_join_keys_on_create_and_patch(self):
-        """The report carries the ID + slug join keys (from the matched Alert CR) on BOTH the
-        create and the re-run patch, so the portal can id-join or slug-join deterministically."""
-        h = self._handler()
-        calls = []
-        orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
-        try:
-            h._upsert_report("krateo-system", "report-x", "🔥 Error log volume", "ALERT",
-                             "6a55c0ba903d2bac4e3615e2", "prompt", "now", existing=None,
-                             context_id="ctx", alert_ref="error-log-volume",
-                             alert_namespace="krateo-system")
-            h._upsert_report("krateo-system", "report-x", "🔥 Error log volume", "ALERT",
-                             "6a55c0ba903d2bac4e3615e2", "prompt", "now",
-                             existing={"metadata": {"annotations": {}}}, context_id="ctx",
-                             alert_ref="error-log-volume", alert_namespace="krateo-system")
-        finally:
-            h._k8s = orig
-        create = next(b for m, b in calls if m == "POST")["spec"]
-        patch = next(b for m, b in calls if m == "PATCH" and b and "spec" in b)["spec"]
-        for spec in (create, patch):
-            self.assertEqual(spec["hyperdxAlertId"], "6a55c0ba903d2bac4e3615e2")
-            self.assertEqual(spec["alertRef"], "error-log-volume")   # stable slug, NOT the emoji name
-            self.assertEqual(spec["alertNamespace"], "krateo-system")
-        # the human-facing display name is kept on create, distinct from the slug
-        self.assertEqual(create["alertName"], "🔥 Error log volume")
-
-    def test_upsert_omits_join_keys_when_alert_unmatched(self):
-        """No matched Alert (empty id/ref) → don't stamp empty join keys; still keep trigger=alert
-        and default alertNamespace to the report namespace on create."""
-        h = self._handler()
-        calls = []
-        orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
-        try:
-            h._upsert_report("krateo-system", "report-x", "orphan-alert", "ALERT", "", "p", "now",
-                             existing=None, alert_ref="", alert_namespace="")
-        finally:
-            h._k8s = orig
-        create = next(b for m, b in calls if m == "POST")["spec"]
-        self.assertNotIn("hyperdxAlertId", create)
-        self.assertNotIn("alertRef", create)
-        self.assertEqual(create["alertNamespace"], "krateo-system")  # defaulted, never empty
-        self.assertEqual(create["trigger"], "alert")
 
     def test_match_alert_looks_up_the_exact_name_the_title_carries(self):
         """The title is a state emoji + the HyperDX alert name, which is the Alert's metadata.name;
@@ -450,7 +389,6 @@ class TestAlertSpecPush(unittest.TestCase):
     def _run(self, r, cr, hdx):
         patched = []
         r._patch_status = lambda name, st: patched.append(st)
-        r._reconcile_report_lifecycle = lambda *a, **k: None
         r._reconcile_cr(hdx, cr, {'id': 's1'}, 'hook1')
         return patched
 

@@ -7,9 +7,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import apiref  # noqa: E402
 import handler  # noqa: E402
+from fake_k8s import FakeK8s  # noqa: E402
 
 REF = {"name": "compositiondefinitions-not-ready", "namespace": "krateo-system"}
 
@@ -113,10 +115,9 @@ class TestReconcileApiRef(unittest.TestCase):
     def setUp(self):
         self.r = importlib.reload(importlib.import_module("reconciler"))
         self.r._now = lambda: "NOW"
-        self.patched, self.started, self.resolved, self.lifecycle = [], [], [], []
+        self.patched, self.started, self.resolved = [], [], []
         self.r._patch_status = lambda name, st: self.patched.append((name, st))
         self.r._start_analysis = lambda **kw: self.started.append(kw)
-        self.r._reconcile_report_lifecycle = lambda *a: self.lifecycle.append(a)
         self.status = {"value": 2, "items": ["fireworksapp"]}
         self.r.apiref.resolve = lambda ref: self.resolved.append(ref) or dict(self.status)
 
@@ -141,7 +142,6 @@ class TestReconcileApiRef(unittest.TestCase):
         st = self.patched[-1][1]
         self.assertEqual((st["state"], st["okSince"]), ("OK", "NOW"))
         self.assertEqual(self.started, [])
-        self.assertEqual([state for _, state in self.lifecycle], ["OK"])
 
     def test_a_snowplow_failure_is_phase_Error_and_keeps_the_state(self):
         def boom(ref):
@@ -222,7 +222,6 @@ class TestReconcileOnceWithApiRef(unittest.TestCase):
         self.r._patch_status = lambda name, st: self.patched.append((name, st))
         self.r._patch_finalizers = lambda *a: None
         self.r._start_analysis = lambda **kw: None
-        self.r._reconcile_report_lifecycle = lambda *a: None
         self.r.apiref.resolve = lambda ref: {"value": 0}
 
     def tearDown(self):
@@ -279,26 +278,18 @@ class TestPrompt(unittest.TestCase):
         self.assertIn("…(truncated)", p)
         self.assertLess(len(p), len(handler.build_prompt("a", "ALERT")) + handler.ITEMS_PROMPT_CHARS + 500)
 
-    def test_analyze_writes_the_apiRef_prompt_to_the_report(self):
-        posted = []
-
-        def k8s(method, path, body=None, subresource=""):
-            if method == "GET":
-                import requests
-                raise requests.HTTPError(response=types.SimpleNamespace(status_code=404))
-            if method == "POST":
-                posted.append(body)
-            return {}
+    def test_analyze_opens_an_incident_with_the_apiRef_prompt(self):
+        k8s = FakeK8s()
         orig = (handler._k8s, handler.a2a_analyze)
         handler._k8s = k8s
         handler.a2a_analyze = lambda prompt, ctx=None: ("analysis", [])
         try:
-            handler.analyze("CompositionDefinition not ready", "ALERT", "krateo-system",
-                            alert_ref="cd-not-ready", alert_namespace="krateo-system", api=self.API)
+            handler.analyze("CompositionDefinition not ready", "ALERT", "cd-not-ready",
+                            "krateo-system", api=self.API)
         finally:
             handler._k8s, handler.a2a_analyze = orig
-        spec = posted[0]["spec"]
-        self.assertEqual(spec["alertRef"], "cd-not-ready")
+        spec = k8s.only()["spec"]
+        self.assertEqual(spec["alertRef"], {"name": "cd-not-ready", "namespace": "krateo-system"})
         self.assertIn("fireworksapp", spec["prompt"])
 
 
