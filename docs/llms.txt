@@ -2,6 +2,8 @@
 Observability plumbing (krateo-platformops): a HyperDX alert webhook -> krateo-autopilot A2A
 root-cause analysis -> TroubleshootingReport CR (observability.krateo.io/v1alpha1) the portal
 renders. It calls an agent; it is not one.
+Identity: one Alert CR = one HyperDX alert named after its metadata.name = one report
+report-<metadata.name>. The webhook title carries that name; the handler looks the Alert up exactly.
 
 docs/overview.md: architecture
 docs/usage.md: install + wire the webhook

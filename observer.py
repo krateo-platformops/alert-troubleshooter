@@ -31,7 +31,7 @@ gaps between the two schemas:
     leading group for core kinds, e.g. "v1/pods" -> group "", version "v1", resource "pods"); an
     AuditRecord carries the three parts separately. We split the step's gvr the same way to compare.
 
-Stdlib + the handler's apiserver helpers only (reuses _k8s / patch_status / _get_report / _stable_name
+Stdlib + the handler's apiserver helpers only (reuses _k8s / patch_status / _get_report
 / _now) — no new deps. Never raises into the poll loop; one bad record/report never stalls the rest.
 """
 import os

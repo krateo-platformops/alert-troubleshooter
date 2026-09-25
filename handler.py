@@ -9,6 +9,7 @@ On POST /webhook (HyperDX alert-fired payload):
 Runs anyone's-browser-independent: this is the "background" path. Minimal deps: stdlib + requests.
 """
 import base64
+import hashlib
 import json
 import os
 import re
@@ -114,27 +115,27 @@ def _k8s(method, path, body=None, subresource=""):
     return r.json()
 
 
-def _safe_name(s):
-    """A valid metadata.generateName prefix: lowercase alnum + '-', from an arbitrary alert title
-    (which may carry spaces, colons, em-dashes, …). k8s 422s on anything else."""
-    slug = re.sub(r"[^a-z0-9-]+", "-", (s or "alert").lower()).strip("-")[:40].strip("-")
-    return slug or "alert"
-
-
 RUN_COUNT_ANNO = "observability.krateo.io/run-count"
 FIRST_RUN_ANNO = "observability.krateo.io/first-run-at"
 LAST_RUN_ANNO = "observability.krateo.io/last-run-at"
 CONTEXT_ID_ANNO = "observability.krateo.io/context-id"
 
 
-def _stable_name(alert_name):
-    """One DETERMINISTIC report CR per alert (upserted), so a re-firing alert bumps a run-count on
-    the SAME report instead of piling up a new near-identical report every cooldown window."""
-    return f"report-{_safe_name(alert_name)}"[:63].rstrip("-")
+def _report_name(alert_name):
+    """One DETERMINISTIC report CR per Alert CR (upserted): `report-<Alert metadata.name>`, so a
+    re-firing alert bumps a run-count on the SAME report and two Alerts never share one.
+
+    Past 63 characters the name is cut and suffixed with a hash of the whole Alert name, so two
+    long names with a common prefix still get two reports."""
+    name = f"report-{alert_name}"
+    if len(name) <= 63:
+        return name
+    digest = hashlib.sha256(alert_name.encode()).hexdigest()[:8]
+    return f"{name[:54].rstrip('-.')}-{digest}"
 
 
-def _context_id(alert_name, run_count=0):
-    """A DETERMINISTIC A2A contextId per alert (uuid5 of the stable report name + a run-count epoch),
+def _context_id(report_name, run_count=0):
+    """A DETERMINISTIC A2A contextId per report (uuid5 of the report name + a run-count epoch),
     so RCA runs of the SAME alert continue ONE kagent conversation thread for rail/deep-link
     continuity — but that thread is ROTATED every CONTEXT_MAX_RUNS runs so its accumulated telemetry
     can never overflow the model's input-token window. Two DIFFERENT alerts get two distinct threads;
@@ -144,7 +145,7 @@ def _context_id(alert_name, run_count=0):
     run_count is the count of THIS run (1-based). Epoch = (run_count - 1) // CONTEXT_MAX_RUNS, so
     runs 1..N share epoch 0, runs N+1..2N share epoch 1, etc. — each epoch a clean, empty thread."""
     epoch = max(0, (int(run_count) - 1)) // CONTEXT_MAX_RUNS
-    seed = _stable_name(alert_name) if epoch == 0 else f"{_stable_name(alert_name)}#e{epoch}"
+    seed = report_name if epoch == 0 else f"{report_name}#e{epoch}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
 
@@ -232,30 +233,34 @@ def _within_cooldown(report):
     return False
 
 
+# A DNS-1123 subdomain: what an Alert CR's metadata.name, and so its HyperDX alert's name, can be.
+_ALERT_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?")
+
+
+def _alert_name_from_title(title):
+    """The Alert CR name a webhook title carries, or "" if it carries none.
+
+    HyperDX titles a notification with a state emoji ("🚨 " firing, "✅ " resolved) followed by
+    the HyperDX alert's name, and the reconciler names that alert after its CR's metadata.name."""
+    name = re.sub(r"^\W+", "", (title or "").strip())
+    return name if len(name) <= 253 and _ALERT_NAME.fullmatch(name) else ""
+
+
 def _match_alert(alert_name, ns):
-    """Look up the fired Alert CR (observability.krateo.io) matching the webhook alertName. The
-    webhook payload's own id/name is unreliable (often empty on the live CR, and the title carries
-    an emoji/prefix the CR's metadata.name/displayName don't), so we match on the alphanumeric core
-    against BOTH the Alert's metadata.name AND spec.displayName — the same normalized key the portal
-    incidents-list uses — and return the whole matched Alert CR. Returns None if no match / on error
-    (best-effort; the caller degrades to an unscoped prompt with no robust id-join)."""
-    def norm(s):
-        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-    target = norm(alert_name)
-    if not target:
+    """The Alert CR (observability.krateo.io) a webhook fired for, by EXACT metadata.name, or None.
+
+    Exact because anything looser picks the wrong CR: two Alerts may share a displayName, and one
+    displayName may contain another ("Pod crash-looping" is inside "Krateo — platform pod
+    crash-looping"). Returns None when the title names no Alert or the lookup fails."""
+    name = _alert_name_from_title(alert_name)
+    if not name:
         return None
     try:
-        alerts = _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/alerts").get("items", [])
-    except Exception:  # noqa: BLE001 — best-effort; fall back to an unscoped prompt
+        return _k8s("GET", f"/apis/{GROUP}/{VERSION}/namespaces/{ns}/alerts/{name}")
+    except Exception as e:  # noqa: BLE001 — a 404 is the common case; HyperDX re-sends while ALERT
+        if getattr(getattr(e, "response", None), "status_code", None) != 404:
+            print(f"[webhook] Alert {ns}/{name} lookup failed ({e})", flush=True)
         return None
-    for a in alerts:
-        meta, spec = a.get("metadata") or {}, a.get("spec") or {}
-        name = norm(meta.get("name", ""))
-        disp = norm(spec.get("displayName", ""))
-        if (name and (name in target or target in name)) or \
-           (disp and (disp in target or target in disp)):
-            return a
-    return None
 
 
 def _tool_results(parts):
@@ -394,41 +399,47 @@ def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False)
 
 
 def process(payload):
-    # HyperDX webhook payload shape varies; extract best-effort.
-    alert_name = (payload.get("alertName") or payload.get("title") or payload.get("name")
-                  or (payload.get("alert") or {}).get("name") or "hyperdx-alert")
-    alert_id = payload.get("id") or payload.get("alertId") or (payload.get("alert") or {}).get("id") or ""
-    alert_state = payload.get("state") or payload.get("status") or "ALERT"
+    # The body is hyperdx_v2.DEFAULT_WEBHOOK_BODY: alertName is the notification title, which
+    # carries the Alert CR's metadata.name, and state is ALERT or OK.
+    title = (payload.get("alertName") or payload.get("title") or payload.get("name")
+             or (payload.get("alert") or {}).get("name") or "")
+    alert_state = str(payload.get("state") or payload.get("status") or "ALERT").upper()
     alert_ns = payload.get("alertNamespace") or NAMESPACE
-    # Resolve the fired Alert CR ONCE: it scopes the RCA (spec.where/message) AND carries the robust
-    # join keys the report needs (status.hyperdxAlertId + metadata.name/namespace). The webhook
-    # payload's own id is unreliable (empty on the live CR), so the Alert CR's status is authoritative.
-    matched = _match_alert(alert_name, alert_ns)
-    m_spec = (matched or {}).get("spec") or {}
-    m_meta = (matched or {}).get("metadata") or {}
-    m_status = (matched or {}).get("status") or {}
-    where, message = (m_spec.get("where"), m_spec.get("message")) if matched else (None, None)
-    # Robust join keys from the Alert CR (fall back to the webhook payload's id when unmatched):
-    alert_id = m_status.get("hyperdxAlertId") or alert_id     # ID join → Alert.status.hyperdxAlertId
-    alert_ref = m_meta.get("name", "")                        # stable slug → /alerts/{ns}/{name}
+    if alert_state == "OK":
+        print(f"[webhook] {title!r} resolved; nothing to analyze", flush=True)
+        return
+    # The fired Alert CR scopes the RCA (spec.where/message) and carries the join keys the report
+    # needs (status.hyperdxAlertId + metadata.name/namespace). Without one there is no scope, so
+    # no RCA runs.
+    matched = _match_alert(title, alert_ns)
+    if matched is None:
+        print(f"[webhook] {title!r} names no Alert in {alert_ns}; skipping", flush=True)
+        return
+    m_spec = matched.get("spec") or {}
+    m_meta = matched.get("metadata") or {}
+    m_status = matched.get("status") or {}
+    where, message = m_spec.get("where"), m_spec.get("message")
+    alert_id = m_status.get("hyperdxAlertId") or ""          # ID join → Alert.status.hyperdxAlertId
+    alert_ref = m_meta.get("name", "")                        # exact key → /alerts/{ns}/{name}
     alert_namespace = m_meta.get("namespace") or alert_ns     # the Alert CR's real namespace
+    display = m_spec.get("displayName") or alert_ref
     prompt = None  # built after the dedup gate, when we know if this is a re-run
-    name = _stable_name(alert_name)
+    name = _report_name(alert_ref)
     now = _now()
     # One report CR per alert, upserted under a lock: re-fires within the cooldown are skipped;
     # otherwise the same CR is re-analyzed and its run-count bumped — no pile-up of duplicate reports.
     with _create_lock:
         existing = _get_report(alert_ns, name)
         if _within_cooldown(existing):
-            print(f"[dedup] {alert_name!r} analyzed recently / in-flight; skipping", flush=True)
+            print(f"[dedup] {alert_ref!r} analyzed recently / in-flight; skipping", flush=True)
             return
         # THIS run's 1-based count = previous run-count + 1 (1 for a first-ever report). The kagent
         # thread is keyed on it so the thread rotates every CONTEXT_MAX_RUNS runs — bounding the
         # accumulated telemetry well under the model's input-token limit.
         run_count = _next_run_count(existing)
-        ctx = _context_id(alert_name, run_count)  # per-alert thread, rotated every CONTEXT_MAX_RUNS
-        prompt = build_prompt(alert_name, alert_state, where, message, rerun=bool(existing))
-        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
+        ctx = _context_id(name, run_count)  # per-report thread, rotated every CONTEXT_MAX_RUNS
+        prompt = build_prompt(display, alert_state, where, message, rerun=bool(existing))
+        _upsert_report(alert_ns, name, display, alert_state, alert_id, prompt, now, existing,
                        ctx, alert_ref=alert_ref, alert_namespace=alert_namespace)
     try:
         raw, tool_ledger = a2a_analyze(prompt, ctx)
