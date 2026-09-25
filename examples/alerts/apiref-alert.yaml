@@ -1,0 +1,33 @@
+# An apiRef Alert: it fires on a value a RESTAction computes from any Custom Resource, not on log
+# rows. The troubleshooter polls it every `interval` through snowplow, as its own authn identity
+# (so the chart needs config.authnUrl), and compares status.value with the threshold.
+apiVersion: templates.krateo.io/v1
+kind: RESTAction
+metadata:
+  name: compositiondefinitions-not-ready
+  namespace: krateo-system
+spec:
+  api:
+    - name: cds             # no endpointRef = in-cluster
+      path: /apis/core.krateo.io/v1alpha1/compositiondefinitions
+  # The contract: {value: N, items?: [...]}. items go into the RCA prompt.
+  filter: |
+    [ .cds.items[]
+      | select(any(.status.conditions[]?; .type == "Ready" and .status == "False"))
+      | .metadata.name ] as $bad
+    | { value: ($bad | length), items: $bad }
+---
+apiVersion: observability.krateo.io/v1alpha1
+kind: Alert
+metadata:
+  name: compositiondefinitions-not-ready
+  namespace: krateo-system
+spec:
+  displayName: CompositionDefinition not ready
+  apiRef:                   # exactly one of where / apiRef
+    name: compositiondefinitions-not-ready
+    namespace: krateo-system
+  interval: 5m              # how often the RESTAction is evaluated
+  threshold: 1
+  thresholdType: above      # fires when value >= 1
+  message: "A CompositionDefinition is not Ready — incident-agent will find out why."
