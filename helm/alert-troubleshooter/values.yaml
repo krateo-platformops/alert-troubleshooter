@@ -16,6 +16,9 @@ config:
   # serviceaccount strategy. Empty (default) DISABLES it — unauthenticated A2A, exactly as before
   # (safe on older clusters with no gateway). Enable in-cluster with: http://authn.krateo-system.svc
   authnUrl: ""
+  # Snowplow, which resolves an apiRef Alert's RESTAction (GET <snowplowUrl>/call) as this service's
+  # authn identity. apiRef alerts therefore also need authnUrl.
+  snowplowUrl: http://snowplow.krateo-system.svc:8081
   # HyperDX v2 external API the reconciler pushes Alert CRs to (Bearer auth via hyperdx-api-token).
   # Default = the krateo-clickstack-api Service the observability stack exposes.
   hyperdxApiUrl: http://krateo-clickstack-api.krateo-system.svc:8000

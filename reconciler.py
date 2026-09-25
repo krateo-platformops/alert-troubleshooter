@@ -4,8 +4,11 @@
 Runs as a background thread in the krateo-alert-troubleshooter process:
 
   every RECONCILE_INTERVAL seconds:
+    for each apiRef Alert CR (spec.apiRef), when spec.interval has elapsed:
+        resolve its RESTAction via snowplow, compare status.value with the threshold, write state;
+        on ALERT start the webhook's RCA path (apiref.py)
     ensure the shared webhook (-> this troubleshooter's /webhook) ->
-    for each Alert CR:
+    for each `where` Alert CR:
         being deleted (deletionTimestamp) -> delete its HyperDX alert+dashboard, drop the finalizer
         else, no status.hyperdxAlertId    -> create dashboard-tile + alert, record ids in status
         else                              -> mirror the live alert state (OK/ALERT/PENDING) to status
@@ -20,10 +23,13 @@ HyperDX Express backend) using Bearer auth against the /api/v2 external API.
 """
 import json
 import os
+import threading
 import time
 
 import requests
 
+import apiref
+import handler
 import hyperdx_v2
 from handler import _get_report, _k8s, _now, _stable_name, patch_status  # reuse the apiserver helpers
 
@@ -304,7 +310,81 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
     print(f"[reconciler] synced Alert {name} -> hyperdx {alert['id']} ({st})", flush=True)
 
 
+def _api_ref(cr):
+    return (cr.get("spec") or {}).get("apiRef")
+
+
+def _start_analysis(**kwargs):
+    """The webhook's RCA path (handler.analyze), off the reconcile thread: an RCA takes minutes."""
+    threading.Thread(target=handler.analyze, kwargs=kwargs, daemon=True).start()
+
+
+def _reconcile_apiref(cr):
+    """Evaluate an apiRef alert when it is due (every `spec.interval`).
+
+    Snowplow resolves the RESTAction; its `value` is compared with the threshold. `state` and
+    `okSince` are written like a HyperDX alert's, and an ALERT starts the same RCA a webhook
+    starts, with the RESTAction's `items` in the prompt. No HyperDX object is involved, and the
+    row-count tautology check does not apply: a RESTAction's value may be any number.
+    """
+    meta, spec, status = cr["metadata"], cr.get("spec", {}), cr.get("status", {})
+    name = meta["name"]
+    display = spec.get("displayName") or name
+    threshold, kind = spec.get("threshold", 1), spec.get("thresholdType", "above")
+    why = apiref.invalid(kind)
+    if why:
+        _patch_status(name, {"phase": "Invalid", "error": why, "lastSyncedAt": _now()})
+        return
+    if not apiref.due(status, spec.get("interval", "5m")):
+        return
+    ref = spec["apiRef"]
+    try:
+        out = apiref.resolve(ref)
+        value = apiref.value_of(out)
+    except apiref.ApiRefError as e:
+        _patch_status(name, {"phase": "Error", "error": str(e)[:300], "lastSyncedAt": _now()})
+        print(f"[reconciler] Alert {name}: apiRef {ref.get('namespace')}/{ref.get('name')} "
+              f"failed ({e})", flush=True)
+        return
+    st = "ALERT" if apiref.exceeds(value, threshold, kind) else "OK"
+    _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "phase": "Synced",
+                         "error": None, "lastSyncedAt": _now()})
+    _reconcile_report_lifecycle(display, st)
+    if st == "ALERT":
+        _start_analysis(alert_name=display, alert_state=st, alert_ns=NAMESPACE,
+                        message=spec.get("message"), alert_ref=name,
+                        alert_namespace=meta.get("namespace") or NAMESPACE,
+                        api={"name": ref.get("name"), "namespace": ref.get("namespace"),
+                             "value": value, "threshold": threshold, "thresholdType": kind,
+                             "items": out.get("items")})
+
+
+def _drop_hyperdx(hdx, cr):
+    """An apiRef alert has no HyperDX objects. Ones left from when the CR used `where` are deleted,
+    so they cannot fire a webhook for it."""
+    status = cr.get("status") or {}
+    ids = {k: status.get(k) for k in ("hyperdxAlertId", "hyperdxDashboardId") if status.get(k)}
+    if not ids:
+        return
+    for delete_fn, key in ((hdx.delete_alert, "hyperdxAlertId"),
+                           (hdx.delete_dashboard, "hyperdxDashboardId")):
+        if ids.get(key):
+            try:
+                delete_fn(ids[key])
+            except Exception:  # noqa: BLE001 — already gone is fine
+                pass
+    _patch_status(cr["metadata"]["name"], {k: None for k in ids})
+
+
 def reconcile_once(hdx):
+    crs = _list_alert_crs()
+    # apiRef alerts first: HyperDX is not involved, so a HyperDX outage must not stop them.
+    for cr in crs:
+        if _api_ref(cr) and not cr["metadata"].get("deletionTimestamp"):
+            try:
+                _reconcile_apiref(cr)
+            except Exception as e:  # noqa: BLE001 — one bad CR shouldn't stall the rest
+                print(f"[reconciler] Alert {cr['metadata'].get('name', '?')} error: {e}", flush=True)
     # One pass = one view of the dashboards. Cleared here rather than aged, so a `where` comparison
     # can never read an answer from a previous cycle.
     hdx.invalidate_cache()
@@ -314,7 +394,8 @@ def reconcile_once(hdx):
     if recreated:
         # the webhook id changed -> alerts referencing the old id would notify a dead channel.
         # Drop the HyperDX alerts we manage + reset their CR status so they rebuild on this webhook.
-        active = [cr for cr in _list_alert_crs() if not cr["metadata"].get("deletionTimestamp")]
+        active = [cr for cr in crs
+                  if not cr["metadata"].get("deletionTimestamp") and not _api_ref(cr)]
         managed = {cr.get("status", {}).get("hyperdxAlertId") for cr in active} - {None, ""}
         for a in hdx.list_alerts():
             if a["id"] in managed:
@@ -324,10 +405,13 @@ def reconcile_once(hdx):
                     pass
         for cr in active:
             _patch_status(cr["metadata"]["name"], {"hyperdxAlertId": None, "phase": "Pending"})
-    for cr in _list_alert_crs():
+    for cr in crs:
         try:
             if cr["metadata"].get("deletionTimestamp"):
                 _finalize(hdx, cr)      # CR is being deleted -> clean up HyperDX + drop finalizer
+                continue
+            if _api_ref(cr):
+                _drop_hyperdx(hdx, cr)  # evaluated above; it keeps no HyperDX objects
                 continue
             _ensure_finalizer(cr)       # guard the CR so its HyperDX resources are cleaned on delete
             _reconcile_cr(hdx, cr, source, webhook_id)
