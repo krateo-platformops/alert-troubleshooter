@@ -10,3 +10,4 @@ docs/api.md: the two CRDs + HTTP surface
 docs/examples.md: runnable examples
 docs/release.md: bare-semver build/release
 helm/alert-troubleshooter/: the chart
+Alert.status.okSince: when the alert last turned OK, unset otherwise; display only.
