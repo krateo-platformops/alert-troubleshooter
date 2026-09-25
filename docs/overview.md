@@ -17,3 +17,9 @@ is acked 202 immediately; analysis runs in a background thread.
 It lives in `krateo-platformops` (not `krateo-agentiko`) because it is observability
 plumbing keyed on the platform `observability.krateo.io` API group and rendered by the
 portal — it *calls* an agent, it is not one.
+
+## Alert status
+
+The reconciler mirrors the HyperDX alert's `state` onto `status.state` every cycle, and writes
+`status.okSince` in the same patch: the time the alert last turned OK, kept while it stays OK and
+unset in any other state. It is for display ("OK for 13 min") and never closes anything.

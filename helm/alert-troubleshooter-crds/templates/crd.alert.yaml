@@ -90,6 +90,13 @@ spec:
                 state:
                   type: string
                   description: Live HyperDX alert state (OK / ALERT / PENDING).
+                okSince:
+                  type: string
+                  format: date-time
+                  nullable: true
+                  description: >
+                    When the alert last turned OK; unset while state is anything but OK. Written
+                    by the loop that writes state, for display only: it never closes an incident.
                 phase:
                   type: string
                   description: >

@@ -169,6 +169,20 @@ def tautology(threshold, threshold_type):
     return None
 
 
+def _ok_since(status, state):
+    """`status.okSince` for a CR whose live state is now `state`.
+
+    The time the alert last turned OK, kept while it stays OK; an OK alert with none gets now.
+    None in every other state, which a merge patch writes as a delete. Display-only: nothing
+    reads it to close or resolve anything.
+    """
+    if state != "OK":
+        return None
+    if status.get("state") == "OK" and status.get("okSince"):
+        return status["okSince"]
+    return _now()
+
+
 def _push_spec(hdx, cr, source, webhook_id, live_alert):
     """Push the CR's spec onto the live HyperDX alert when they disagree. Returns what changed.
 
@@ -262,12 +276,14 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
             # AND MUST NOT CLAIM Synced. `phase` used to say Synced unconditionally here; saying it
             # while the spec sits unpushed is what cost an afternoon to find, because the status
             # actively asserted the opposite of the truth.
-            _patch_status(name, {"state": st, "phase": "SpecDrift", "error": str(e)[:300],
+            _patch_status(name, {"state": st, "okSince": _ok_since(status, st),
+                                 "phase": "SpecDrift", "error": str(e)[:300],
                                  "lastSyncedAt": _now()})
             print(f"[reconciler] Alert {name}: spec push failed, phase=SpecDrift ({e})", flush=True)
             _reconcile_report_lifecycle(display, st)
             return
-        _patch_status(name, {"state": st, "phase": "Synced", "lastSyncedAt": _now()})
+        _patch_status(name, {"state": st, "okSince": _ok_since(status, st), "phase": "Synced",
+                             "lastSyncedAt": _now()})
         if changed:
             print(f"[reconciler] Alert {name}: pushed {', '.join(changed)} to hyperdx {hdx_id}", flush=True)
         _reconcile_report_lifecycle(display, st)
@@ -282,7 +298,8 @@ def _reconcile_cr(hdx, cr, source, webhook_id):
                              message=spec.get("message", ""))
     st = alert.get("state", "OK")
     _patch_status(name, {"hyperdxAlertId": alert["id"], "hyperdxDashboardId": dash_id,
-                         "state": st, "phase": "Synced", "lastSyncedAt": _now()})
+                         "state": st, "okSince": _ok_since(status, st), "phase": "Synced",
+                         "lastSyncedAt": _now()})
     _reconcile_report_lifecycle(display, st)
     print(f"[reconciler] synced Alert {name} -> hyperdx {alert['id']} ({st})", flush=True)
 
