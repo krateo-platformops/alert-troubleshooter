@@ -40,5 +40,14 @@ kubectl apply -f default-alerts.yaml
 kubectl -n krateo-system get alerts
 ```
 
+## Alerting on a Custom Resource (`apiRef`)
+
+Instead of `where`, an Alert can set `spec.apiRef {name, namespace}`: a RESTAction whose filter
+returns `{value: N, items?: [...]}`. The troubleshooter polls it every `interval` through snowplow,
+as its own authn identity (`config.authnUrl` must be set), compares `value` with the threshold, and
+on ALERT runs the same RCA with `items` in the prompt. HyperDX is not involved. See
+[`apiref-alert.yaml`](./apiref-alert.yaml). The identity has cluster-wide read, so any read-only
+RESTAction works; snowplow's `GET /rbac?apiRefName=&apiRefNamespace=` lists what one reads.
+
 For a full fault-injection lab (13 alerts paired with a `breakers.yaml` that injects each fault), see
 [`krateo-agentiko/incident-agent` → `examples/alert-lab/`](https://github.com/krateo-agentiko/incident-agent/tree/main/examples/alert-lab).

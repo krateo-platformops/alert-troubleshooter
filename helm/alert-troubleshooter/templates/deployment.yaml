@@ -102,6 +102,8 @@ subjects:
   # <user>-clientconfig, so the apiserver sees that cert's CN as the User and its O= entries as Groups.
   # The cert carries O=krateo:alert-troubleshooter (serviceaccount-authn.yaml spec.groups), never
   # system:serviceaccount:..., so only a Group subject authorizes the read granted above.
+  # Snowplow resolves an apiRef Alert's RESTAction as this same identity: the read above covers
+  # `get restactions` and every read a RESTAction makes.
   - kind: Group
     name: krateo:alert-troubleshooter
     apiGroup: rbac.authorization.k8s.io
@@ -154,6 +156,9 @@ spec:
             # Empty (default) = unauthenticated A2A, exactly as before (older clusters with no gateway).
             - name: AUTHN_URL
               value: {{ .Values.config.authnUrl | quote }}
+            # apiRef alerts: snowplow resolves the RESTAction under the service JWT above.
+            - name: SNOWPLOW_URL
+              value: {{ .Values.config.snowplowUrl | quote }}
             - name: REPORT_COOLDOWN
               value: {{ .Values.config.reportCooldown | quote }}     # dedup window (s): don't re-analyze the same alert within this
             # --- reconciler (Alert CRs -> HyperDX v2 external API, Bearer auth) ---

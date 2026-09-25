@@ -45,6 +45,8 @@ REPORT_COOLDOWN = int(os.environ.get("REPORT_COOLDOWN", "1800"))
 # from scratch anyway. At a conservative ~15k tokens of telemetry per run, 10 runs ~= 150k tokens --
 # an order of magnitude under the limit, with ample headroom for a verbose run.
 CONTEXT_MAX_RUNS = max(1, int(os.environ.get("CONTEXT_MAX_RUNS", "10")))
+# How much of an apiRef alert's `items` goes into the RCA prompt.
+ITEMS_PROMPT_CHARS = 4000
 
 # Intra-service auth (Option A). The alert->RCA pipeline is autonomous — it carries NO user JWT —
 # but incident-agent's MCP tools sit behind agentgateway, whose authz allows /mcp only with a valid
@@ -357,7 +359,7 @@ def a2a_analyze(prompt, context_id=None):
     return out.strip(), ledger
 
 
-def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False):
+def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False, api=None):
     """The user message carries the INCIDENT; the agent's system prompt carries the METHOD.
 
     This used to restate the investigation itself — find the rows by Body, add no severity filter,
@@ -389,8 +391,25 @@ def build_prompt(alert_name, alert_state, where=None, message=None, rerun=False)
             + ". That query is your entry point, and the workload those rows name is what you "
             "diagnose."
         )
+    source = "HyperDX alert"
+    if api:
+        # An apiRef alert: the value came from a RESTAction, and its items are the objects that
+        # matched, so they are the entry point.
+        source = "Krateo alert"
+        scope = (
+            f"\n\nIt fired because RESTAction `{api['namespace']}/{api['name']}` returned value "
+            f"{api['value']} ({api['thresholdType']} {api['threshold']})"
+            + (f" — intent: {message}" if message else "") + "."
+        )
+        items = api.get("items")
+        if items:
+            shown = json.dumps(items, default=str)
+            if len(shown) > ITEMS_PROMPT_CHARS:
+                shown = shown[:ITEMS_PROMPT_CHARS] + " …(truncated)"
+            scope += (" The objects it matched are your entry point, and they are what you "
+                      f"diagnose:\n{shown}")
     return rerun_preamble + (
-        f'The HyperDX alert "{alert_name}" has fired (state {alert_state}) on this Krateo '
+        f'The {source} "{alert_name}" has fired (state {alert_state}) on this Krateo '
         "PlatformOps cluster." + scope +
         "\n\nRoot-cause it: the single most likely cause, the composition or component affected, "
         "and an ordered remediation plan."
@@ -423,6 +442,19 @@ def process(payload):
     alert_ref = m_meta.get("name", "")                        # exact key → /alerts/{ns}/{name}
     alert_namespace = m_meta.get("namespace") or alert_ns     # the Alert CR's real namespace
     display = m_spec.get("displayName") or alert_ref
+    analyze(display, alert_state, alert_ns, where=where, message=message, alert_id=alert_id,
+            alert_ref=alert_ref, alert_namespace=alert_namespace)
+
+
+def analyze(alert_name, alert_state, alert_ns, where=None, message=None, alert_id="",
+            alert_ref="", alert_namespace="", api=None):
+    """Run the RCA for one firing of an alert and write it to that alert's report.
+
+    Both entry points call it: the HyperDX webhook (process) and the evaluation of an apiRef
+    alert (reconciler), which passes `api` = {name, namespace, value, threshold, thresholdType,
+    items}. `alert_name` is the displayName, `alert_ref` the Alert's metadata.name. A firing
+    inside the report's cooldown, or while it is still analyzing, is skipped.
+    """
     prompt = None  # built after the dedup gate, when we know if this is a re-run
     name = _report_name(alert_ref)
     now = _now()
@@ -438,8 +470,9 @@ def process(payload):
         # accumulated telemetry well under the model's input-token limit.
         run_count = _next_run_count(existing)
         ctx = _context_id(name, run_count)  # per-report thread, rotated every CONTEXT_MAX_RUNS
-        prompt = build_prompt(display, alert_state, where, message, rerun=bool(existing))
-        _upsert_report(alert_ns, name, display, alert_state, alert_id, prompt, now, existing,
+        prompt = build_prompt(alert_name, alert_state, where, message, rerun=bool(existing),
+                              api=api)
+        _upsert_report(alert_ns, name, alert_name, alert_state, alert_id, prompt, now, existing,
                        ctx, alert_ref=alert_ref, alert_namespace=alert_namespace)
     try:
         raw, tool_ledger = a2a_analyze(prompt, ctx)

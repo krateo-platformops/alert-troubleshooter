@@ -12,3 +12,6 @@ docs/api.md: the two CRDs + HTTP surface
 docs/examples.md: runnable examples
 docs/release.md: bare-semver build/release
 helm/alert-troubleshooter/: the chart
+Alert.status.okSince: when the alert last turned OK, unset otherwise; display only.
+Alert.status.value: an apiRef alert's last RESTAction number, unset for a where alert; display only.
+Alert.spec.apiRef: a RESTAction ({value: N, items?}) polled every interval via snowplow instead of a HyperDX where; needs config.authnUrl.
