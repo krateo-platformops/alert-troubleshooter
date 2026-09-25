@@ -19,3 +19,17 @@ HyperDX alert per CR, named after its `metadata.name`, and the shared webhook th
 `http://krateo-alert-troubleshooter.krateo-system.svc:8080/webhook`. A HyperDX alert fires an RCA
 only if its name is an `Alert` CR's `metadata.name`. Each firing is recorded on an `Incident`, so
 incident-controller's CRD chart must be installed first; without it a firing is logged and lost.
+
+## Who can see alerts
+
+The portal reads `Alert` CRs with the signed-in user's own token. The chart ships the ClusterRole
+`alert-viewer` (get/list/watch on `alerts.observability.krateo.io`) with no binding and no
+aggregation labels, so no user sees alerts until an admin binds it to a group. A RoleBinding
+limits it to the Alerts' namespace:
+
+```sh
+kubectl create rolebinding alert-viewer-devs -n krateo-system --clusterrole=alert-viewer --group=devs
+```
+
+A ClusterRoleBinding (`kubectl create clusterrolebinding … --clusterrole=alert-viewer`) grants it in
+every namespace.
