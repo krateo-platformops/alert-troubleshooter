@@ -131,8 +131,9 @@ class HandlerToolLedger(unittest.TestCase):
     def test_function_response_parts_are_captured(self):
         parts = [
             {"kind": "text", "text": "Looking at the pods..."},
-            {"kind": "data", "data": {"adk_type": "function_response", "name": "k8s_get_resources",
-                                      "response": {"error": "pods is forbidden"}}},
+            {"kind": "data", "metadata": {"adk_type": "function_response"},
+             "data": {"id": "call_1", "name": "k8s_get_resources",
+                      "response": {"error": "pods is forbidden"}}},
         ]
         got = self.handler._tool_results(parts)
         self.assertEqual(len(got), 1)

@@ -258,41 +258,65 @@ def _match_alert(alert_name, ns):
     return None
 
 
+def _part_type(part):
+    """A DataPart's ADK type (`function_call`, `function_response`, …). Both kagent runtimes put it
+    in the part's METADATA, not its data: the Go runtime as `adk_type`, the Python one as
+    `kagent_type`."""
+    meta = part.get("metadata")
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("adk_type") or meta.get("kagent_type") or "")
+
+
+def _result_text(resp):
+    """The text a tool returned. The Go runtime wraps it as `{output}` or `{error}`; the Python
+    runtime passes the MCP result through as `{content: [{type, text}], isError}`."""
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, dict):
+        content = resp.get("content")
+        if isinstance(content, list):
+            texts = [c["text"] for c in content
+                     if isinstance(c, dict) and isinstance(c.get("text"), str)]
+            if texts:
+                return "\n".join(texts)
+        for key in ("error", "output", "result"):
+            value = resp.get(key)
+            if isinstance(value, str):
+                return value
+            if isinstance(value, dict):
+                return _result_text(value)
+    return json.dumps(resp, default=str)
+
+
 def _tool_results(parts):
     """Every tool RESULT in one A2A message, as report_v2's ledger entry shape.
 
     THE SHAPE IS report_v2._from_tool_ledger's CONTRACT — `name`, `payload`, `failed` — and it is
-    written here to match, not approximated. Two functions deciding the same thing in different
-    words is how the 515 status-write bug survived review in git-provider this week.
+    written here to match, not approximated.
 
-    THIS IS THE GROUND TRUTH THAT USED TO BE THROWN AWAY. kagent mirrors every non-partial part
-    onto the status stream, including the tool-call and tool-result DataParts the ADK stamps
-    `adk_type: function_response` — so "k8s_get_resources returned Forbidden" was already on the
-    wire, one line above the filter that kept only `kind == "text"`. The observer could publish
-    0.97 confidence on an analysis in which every cluster read was denied precisely because the
-    denial never reached the code that scores the report (#30).
+    kagent mirrors every non-partial ADK event onto the status stream, so each tool result arrives
+    as a DataPart typed `function_response` (see _part_type) whose data is the GenAI
+    FunctionResponse, `{id, name, response}`. This is the ground truth report_v2 bounds confidence
+    by (#30).
 
     Defensive by construction: kagent's exact part shape has changed before and this must never be
     the reason an analysis fails. Anything unrecognised yields nothing and the report degrades to
-    model-declared retrieval, which is what 0.2.37 already did."""
+    model-declared retrieval."""
     out = []
     for p in parts or []:
-        if not isinstance(p, dict) or p.get("kind") == "text":
+        if not isinstance(p, dict):
             continue
         data = p.get("data")
-        if not isinstance(data, dict):
-            continue
-        if "function_response" not in str(data.get("adk_type", "")):
+        if not isinstance(data, dict) or _part_type(p) != "function_response":
             continue
         resp = data.get("response")
-        if resp is None:
-            resp = {k: v for k, v in data.items() if k not in ("adk_type", "name", "id")}
-        payload = resp if isinstance(resp, str) else json.dumps(resp, default=str)
         # `failed` says the CALL errored, which is what lets report_v2 tell a refusal we suffered
-        # from a refusal we are REPORTING. The ADK does not set a uniform flag, so infer it from
-        # the response carrying an error and let the text classifier settle denied-vs-errored.
+        # from a refusal we are REPORTING. The runtimes flag it differently (`error` vs `isError`);
+        # the text classifier settles denied-vs-errored.
         failed = bool(isinstance(resp, dict) and (resp.get("error") or resp.get("isError")))
-        out.append({"name": str(data.get("name") or ""), "payload": payload, "failed": failed})
+        out.append({"name": str(data.get("name") or ""), "payload": _result_text(resp),
+                    "failed": failed})
     return out
 
 

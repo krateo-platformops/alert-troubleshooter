@@ -417,6 +417,16 @@ def _retrieval(v):
     return out
 
 
+def _tool_success_outcome(text):
+    """The outcome of a tool call the runtime did NOT flag as failed. Its text is DATA — a pod's
+    `timeout=1s` probe, an Incident whose prompt quotes "Forbidden: cannot list pods" — so only a
+    refusal that names the analyzer itself, or an empty result, moves it off success."""
+    if _DENIAL_RE.search(text) and any(ANALYZER_IDENTITY in s.lower()
+                                       for s in _SUBJECT_RE.findall(text)):
+        return "denied"
+    return "empty" if _EMPTY_RE.search(text) else "success"
+
+
 def _from_tool_ledger(tool_ledger):
     """Ground truth: the tool RESULTS the handler lifted off the A2A stream. `failed` means the
     call itself returned an error payload, so a refusal in it is unambiguously ours."""
@@ -431,7 +441,7 @@ def _from_tool_ledger(tool_ledger):
         if t.get("failed"):
             outcome = "denied" if _DENIAL_RE.search(payload) else "errored"
         else:
-            outcome = _classify_outcome(payload)
+            outcome = _tool_success_outcome(payload)
         e = {"source": _tool_class(name), "scope": name, "outcome": outcome}
         if outcome != "success":  # a success needs no explanation; keep the CR status small
             e["detail"] = payload[:512]
