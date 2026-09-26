@@ -1,4 +1,4 @@
-"""Unit tests for the TroubleshootingReport v2 structured-report contract (report_v2.py)
+"""Unit tests for the Incident's structured-report contract (report_v2.py)
 plus the thin handler-side wiring. Stdlib unittest; no cluster, no network.
 
 Run from the repo root:  python3 -m unittest discover -s tests -v
@@ -14,6 +14,20 @@ import report_v2
 from report_v2 import parse_structured_report
 
 PROSE = "## Root cause\nThe deployment is crash-looping.\n\n## Remediation\nFix the image tag."
+
+PRECONDITION = (
+    "#!/usr/bin/env bash\n"
+    "# Holds while payment-api runs the missing tag v9.\n"
+    "i=$(kubectl get deployment payment-api -n prod"
+    " -o jsonpath='{.spec.template.spec.containers[?(@.name==\"api\")].image}') || exit 2\n"
+    "[ \"$i\" = payment:v9 ] && exit 1\n"
+    "exit 0\n")
+APPLY = ("#!/usr/bin/env bash\n# Point payment-api back to v8, the last tag the registry serves.\n"
+         "kubectl set image deployment/payment-api api=payment:v8 -n prod\n")
+VERIFY = ("#!/usr/bin/env bash\n# Fixed once payment-api is off v9 and available.\n"
+          "d=$(kubectl get deployment payment-api -n prod -o json) || exit 2\n"
+          "jq -e '.status.availableReplicas == .spec.replicas' <<<\"$d\" >/dev/null\n"
+          "case $? in 0) exit 0 ;; 1) exit 1 ;; *) exit 2 ;; esac\n")
 
 VALID_BLOCK = {
     "analyzedResources": [
@@ -31,12 +45,7 @@ VALID_BLOCK = {
         {"step": 2, "statement": "Tag v9 does not exist in the registry", "evidenceRefs": [1]},
     ],
     "rootCause": {"statement": "Bad image tag v9", "confidence": 0.85, "category": "image"},
-    "remediationPlan": [
-        {"description": "Point the deployment back to v8", "verb": "patch",
-         "gvr": "apps/v1/deployments", "target": {"name": "payment-api", "namespace": "prod"},
-         "payload": {"spec": {"template": {"spec": {"containers": [{"name": "api", "image": "payment:v8"}]}}}},
-         "successCriterion": "deployment Available=True, restarts stop"},
-    ],
+    "howToFix": {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY},
 }
 
 
@@ -56,11 +65,8 @@ class TestValidV2(unittest.TestCase):
         self.assertEqual(v2["reasoningTrace"][0]["evidenceRefs"], [0, 1])
         self.assertEqual(v2["rootCause"],
                          {"statement": "Bad image tag v9", "category": "image", "confidence": "0.85"})
-        plan = v2["remediationPlan"][0]
-        self.assertEqual(plan["verb"], "patch")
-        self.assertEqual(plan["target"], {"name": "payment-api", "namespace": "prod"})
-        self.assertIn("payload", plan)
-        self.assertEqual(plan["observedOutcome"], "")       # ALWAYS empty pre-apply
+        self.assertEqual(v2["howToFix"],
+                         {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY})
 
     def test_unfenced_json_tag_still_parses(self):
         prose, v2 = parse_structured_report(answer(VALID_BLOCK, fence=""))  # bare ``` fence
@@ -78,11 +84,12 @@ class TestValidV2(unittest.TestCase):
         self.assertEqual(prose, "Bad image tag v9")         # falls back to the root-cause statement
         self.assertTrue(v2)
 
-    def test_observed_outcome_from_agent_is_discarded(self):
+    def test_remediation_plan_is_not_carried(self):
         block = json.loads(json.dumps(VALID_BLOCK))
-        block["remediationPlan"][0]["observedOutcome"] = "I already fixed it"  # it must NOT claim this
+        block["remediationPlan"] = [{"description": "Point the deployment back to v8", "verb": "patch"}]
         _, v2 = parse_structured_report(answer(block))
-        self.assertEqual(v2["remediationPlan"][0]["observedOutcome"], "")
+        self.assertNotIn("remediationPlan", v2)
+        self.assertIn("howToFix", v2)
 
 
 class TestFallbacks(unittest.TestCase):
@@ -108,7 +115,7 @@ class TestFallbacks(unittest.TestCase):
 
     def test_never_raises_on_garbage_shapes(self):
         garbage = {"sources": "not-a-list", "reasoningTrace": {"step": 1}, "rootCause": ["x"],
-                   "remediationPlan": 42, "missingContext": {"a": 1}, "assumptions": [{}],
+                   "howToFix": 42, "missingContext": {"a": 1}, "assumptions": [{}],
                    "analyzedResources": [None, 3, "x"]}
         text = answer(garbage)
         prose, v2 = parse_structured_report(text)
@@ -167,19 +174,80 @@ class TestSanitizers(unittest.TestCase):
         self.assertNotIn("rootCause", v2)
         self.assertEqual(v2["missingContext"], ["kept so the block is non-empty"])
 
-    def test_plan_requires_description_and_dict_payload(self):
-        block = {"remediationPlan": [
-                     {"verb": "delete"},                                   # no description → dropped
-                     {"description": "restart", "payload": "not-a-dict"},  # payload dropped, step kept
-                 ],
-                 "rootCause": {"statement": "x"}}
-        _, v2 = parse_structured_report(answer(block))
-        self.assertEqual(len(v2["remediationPlan"]), 1)
-        self.assertNotIn("payload", v2["remediationPlan"][0])
+
+class TestHowToFix(unittest.TestCase):
+    """status.howToFix: all three scripts or none, never truncated, and a dropped set is said in
+    missingContext when there is a root cause to fix."""
+
+    NOTE = ": the incident has no scripts to check or fix it."
+
+    def _parse(self, how, **extra):
+        block = {"rootCause": {"statement": "x"}, "missingContext": ["gap"],
+                 "sources": [{"type": "object", "ref": "prod/payment-api", "excerpt": "payment:v9"}],
+                 **extra}
+        if how is not ...:
+            block["howToFix"] = how
+        return parse_structured_report(answer(block))[1]
+
+    def test_scripts_are_kept_verbatim_with_one_trailing_newline(self):
+        v2 = self._parse({"precondition": "\n  " + PRECONDITION + "\n\n", "apply": APPLY,
+                          "verify": VERIFY.rstrip("\n")})
+        self.assertEqual(v2["howToFix"],
+                         {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY})
+        self.assertEqual(v2["missingContext"], ["gap"])
+
+    def test_a_partial_set_is_dropped_whole_and_the_report_kept(self):
+        v2 = self._parse({"precondition": PRECONDITION, "apply": APPLY})
+        self.assertNotIn("howToFix", v2)
+        self.assertEqual(v2["rootCause"]["statement"], "x")
+        self.assertEqual(v2["missingContext"], ["gap", "No usable howToFix (verify missing)" + self.NOTE])
+
+    def test_non_string_and_blank_scripts_are_missing(self):
+        v2 = self._parse({"precondition": 42, "apply": {"cmd": "kubectl"}, "verify": "   "})
+        self.assertNotIn("howToFix", v2)
+        self.assertEqual(v2["missingContext"][-1], "No usable howToFix (precondition missing; "
+                                                   "apply missing; verify missing)" + self.NOTE)
+
+    def test_an_over_long_script_is_dropped_never_truncated(self):
+        long_apply = "#!/usr/bin/env bash\n" + "x" * report_v2.SCRIPT_MAX_CHARS
+        v2 = self._parse({"precondition": PRECONDITION, "apply": long_apply, "verify": VERIFY})
+        self.assertNotIn("howToFix", v2)
+        self.assertIn(f"apply over {report_v2.SCRIPT_MAX_CHARS} characters", v2["missingContext"][-1])
+
+    def test_a_list_of_lines_is_joined(self):
+        v2 = self._parse({"precondition": PRECONDITION.splitlines(), "apply": APPLY, "verify": VERIFY})
+        self.assertEqual(v2["howToFix"]["precondition"], PRECONDITION)
+
+    def test_keys_other_than_the_three_scripts_are_dropped(self):
+        v2 = self._parse({"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY,
+                          "description": "roll back"})
+        self.assertEqual(sorted(v2["howToFix"]), ["apply", "precondition", "verify"])
+
+    def test_a_non_object_is_dropped(self):
+        v2 = self._parse("kubectl set image deployment/payment-api api=payment:v8")
+        self.assertNotIn("howToFix", v2)
+        self.assertEqual(v2["missingContext"][-1], "No usable howToFix (not an object)" + self.NOTE)
+
+    def test_an_absent_how_to_fix_is_noted_only_under_a_root_cause(self):
+        self.assertEqual(self._parse(...)["missingContext"][-1],
+                         "No usable howToFix (none returned)" + self.NOTE)
+        _, v2 = parse_structured_report(answer({"missingContext": ["could not read pods"]}))
+        self.assertEqual(v2["missingContext"], ["could not read pods"])
+
+    def test_how_to_fix_alone_is_a_structured_block(self):
+        how = {"precondition": PRECONDITION, "apply": APPLY, "verify": VERIFY}
+        prose, v2 = parse_structured_report(answer({"howToFix": how}))
+        self.assertEqual(prose, PROSE)
+        self.assertEqual(v2, {"howToFix": how})
+
+    def test_the_handler_writes_and_clears_how_to_fix(self):
+        """The handler sends every V2_STATUS_KEYS key on each run, null when absent."""
+        self.assertIn("howToFix", report_v2.V2_STATUS_KEYS)
+        self.assertNotIn("remediationPlan", report_v2.V2_STATUS_KEYS)
 
 
 class TestHandlerWiring(unittest.TestCase):
-    """The thin handler-side pieces: prompt carries the contract; the CR gets trigger=alert."""
+    """The thin handler-side pieces: the prompt carries the contract; the webhook finds its Alert."""
 
     def _handler(self):
         import handler  # imports requests; safe — the server only starts under __main__
@@ -194,93 +262,46 @@ class TestHandlerWiring(unittest.TestCase):
         self.assertIn("0-based indices into \"sources\"", p)
         self.assertTrue(p.rstrip().endswith("no trailing commas)."))
 
-    def test_upsert_sets_trigger_alert_on_create_and_patch(self):
-        h = self._handler()
-        calls = []
-        orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
-        try:
-            h._upsert_report("ns", "report-x", "x", "ALERT", "id", "prompt", "now", existing=None)
-            h._upsert_report("ns", "report-x", "x", "ALERT", "id", "prompt", "now",
-                             existing={"metadata": {"annotations": {}}})
-        finally:
-            h._k8s = orig
-        create = next(b for m, b in calls if m == "POST")
-        patch = next(b for m, b in calls if m == "PATCH" and b and "spec" in b)
-        self.assertEqual(create["spec"]["trigger"], "alert")
-        self.assertEqual(patch["spec"]["trigger"], "alert")
+    def test_prompt_carries_the_how_to_fix_contract(self):
+        p = self._handler().build_prompt("err-logs", "ALERT", where="body:ERROR")
+        self.assertIn('"howToFix": {"precondition"', p)
+        self.assertIn("0 = the incident is gone, 1 = it still holds", p)
+        self.assertIn("MUST exit 1 then", p)
+        self.assertIn("TEST THE ROOT-CAUSE OBJECT, NEVER THE ALERT'S SIGNAL", p)
+        self.assertIn("killed after 60 seconds", p)
+        self.assertIn("how to fix it.", p)
+        self.assertNotIn("remediationPlan", p)
+        self.assertNotIn("remediation plan", p)
 
-    def test_upsert_populates_robust_join_keys_on_create_and_patch(self):
-        """The report carries the ID + slug join keys (from the matched Alert CR) on BOTH the
-        create and the re-run patch, so the portal can id-join or slug-join deterministically."""
-        h = self._handler()
-        calls = []
-        orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
-        try:
-            h._upsert_report("krateo-system", "report-x", "🔥 Error log volume", "ALERT",
-                             "6a55c0ba903d2bac4e3615e2", "prompt", "now", existing=None,
-                             context_id="ctx", alert_ref="error-log-volume",
-                             alert_namespace="krateo-system")
-            h._upsert_report("krateo-system", "report-x", "🔥 Error log volume", "ALERT",
-                             "6a55c0ba903d2bac4e3615e2", "prompt", "now",
-                             existing={"metadata": {"annotations": {}}}, context_id="ctx",
-                             alert_ref="error-log-volume", alert_namespace="krateo-system")
-        finally:
-            h._k8s = orig
-        create = next(b for m, b in calls if m == "POST")["spec"]
-        patch = next(b for m, b in calls if m == "PATCH" and b and "spec" in b)["spec"]
-        for spec in (create, patch):
-            self.assertEqual(spec["hyperdxAlertId"], "6a55c0ba903d2bac4e3615e2")
-            self.assertEqual(spec["alertRef"], "error-log-volume")   # stable slug, NOT the emoji name
-            self.assertEqual(spec["alertNamespace"], "krateo-system")
-        # the human-facing display name is kept on create, distinct from the slug
-        self.assertEqual(create["alertName"], "🔥 Error log volume")
-
-    def test_upsert_omits_join_keys_when_alert_unmatched(self):
-        """No matched Alert (empty id/ref) → don't stamp empty join keys; still keep trigger=alert
-        and default alertNamespace to the report namespace on create."""
-        h = self._handler()
-        calls = []
-        orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": calls.append((method, body)) or {}
-        try:
-            h._upsert_report("krateo-system", "report-x", "orphan-alert", "ALERT", "", "p", "now",
-                             existing=None, alert_ref="", alert_namespace="")
-        finally:
-            h._k8s = orig
-        create = next(b for m, b in calls if m == "POST")["spec"]
-        self.assertNotIn("hyperdxAlertId", create)
-        self.assertNotIn("alertRef", create)
-        self.assertEqual(create["alertNamespace"], "krateo-system")  # defaulted, never empty
-        self.assertEqual(create["trigger"], "alert")
-
-    def test_match_alert_matches_emoji_display_name_and_returns_cr(self):
-        """The webhook title carries an emoji the Alert's slug/displayName don't; _match_alert
-        normalizes both sides and returns the whole Alert CR (id + slug come off it)."""
+    def test_match_alert_looks_up_the_exact_name_the_title_carries(self):
+        """The title is a state emoji + the HyperDX alert name, which is the Alert's metadata.name;
+        _match_alert GETs exactly that CR."""
         h = self._handler()
         alert_cr = {"metadata": {"name": "error-log-volume", "namespace": "krateo-system"},
-                    "spec": {"displayName": "Error log volume", "where": "SeverityText:error"},
+                    "spec": {"displayName": "Error log volume"},
                     "status": {"hyperdxAlertId": "6a55c0ba903d2bac4e3615e2", "state": "ALERT"}}
+        paths = []
         orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": {"items": [alert_cr]}
+        h._k8s = lambda method, path, body=None, subresource="": paths.append(path) or alert_cr
         try:
-            m = h._match_alert("🔥 Error log volume", "krateo-system")
+            m = h._match_alert("🚨 error-log-volume", "krateo-system")
         finally:
             h._k8s = orig
-        self.assertIsNotNone(m)
         self.assertEqual(m["metadata"]["name"], "error-log-volume")
-        self.assertEqual(m["status"]["hyperdxAlertId"], "6a55c0ba903d2bac4e3615e2")
+        self.assertEqual(paths, ["/apis/observability.krateo.io/v1alpha1/namespaces/krateo-system"
+                                 "/alerts/error-log-volume"])
 
-    def test_match_alert_returns_none_when_no_alert_matches(self):
+    def test_match_alert_returns_none_when_the_title_is_no_alert_name(self):
+        """A displayName title (spaces, capitals) is not a metadata.name: no lookup, no match."""
         h = self._handler()
+        calls = []
         orig = h._k8s
-        h._k8s = lambda method, path, body=None, subresource="": {"items": [
-            {"metadata": {"name": "cpu-alert"}, "spec": {"displayName": "CPU"}}]}
+        h._k8s = lambda *a, **k: calls.append(a) or {}
         try:
-            self.assertIsNone(h._match_alert("disk pressure", "krateo-system"))
+            self.assertIsNone(h._match_alert("🚨 Pod crash-looping", "krateo-system"))
         finally:
             h._k8s = orig
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
@@ -300,7 +321,10 @@ class TestYamlThenJsonFixture(unittest.TestCase):
         prose, v2 = report_v2.parse_structured_report(raw)
         self.assertTrue(v2, "structured block must parse")
         self.assertTrue((v2.get("rootCause") or {}).get("statement"))
-        self.assertTrue(v2.get("remediationPlan"))
+        # the reply carries a remediationPlan and no howToFix
+        self.assertNotIn("remediationPlan", v2)
+        self.assertNotIn("howToFix", v2)
+        self.assertTrue(v2["missingContext"][-1].startswith("No usable howToFix (none returned)"))
         # the yaml example stays in the prose; the json block is stripped
         self.assertIn("```yaml", prose)
         self.assertNotIn('"remediationPlan"', prose)
@@ -332,11 +356,11 @@ class TestAlertSpecPush(unittest.TestCase):
             self.tile_reads.append(dash)
             return self._tile_where
 
-        def update_dashboard_tile(self, dash, name, source, where=''):
-            self.tile_puts.append({'dash': dash, 'where': where})
+        def update_dashboard_tile(self, dash, name, source, where='', tile_id='count'):
+            self.tile_puts.append({'dash': dash, 'where': where, 'tile': tile_id})
             self._tile_where = where
 
-        def alert_drift(self, live, **desired):
+        def alert_drift(self, live, name=None, **desired):
             want = {'interval': desired['interval'], 'threshold': desired['threshold'],
                     'thresholdType': desired['threshold_type'], 'message': desired['message']}
             return {k: (live.get(k), v) for k, v in want.items() if str(live.get(k)) != str(v)}
@@ -365,7 +389,6 @@ class TestAlertSpecPush(unittest.TestCase):
     def _run(self, r, cr, hdx):
         patched = []
         r._patch_status = lambda name, st: patched.append(st)
-        r._reconcile_report_lifecycle = lambda *a, **k: None
         r._reconcile_cr(hdx, cr, {'id': 's1'}, 'hook1')
         return patched
 

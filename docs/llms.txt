@@ -1,12 +1,23 @@
 # alert-troubleshooter
-Observability plumbing (krateo-platformops): a HyperDX alert webhook -> krateo-autopilot A2A
-root-cause analysis -> TroubleshootingReport CR (observability.krateo.io/v1alpha1) the portal
-renders. It calls an agent; it is not one.
+Observability plumbing (krateo-platformops): an Alert firing (HyperDX webhook or apiRef) -> an
+Incident (observability.krateo.io/v1alpha1, incident-controller's CRD) with an incident-agent A2A
+root-cause analysis. It calls an agent; it is not one.
+Identity: one Alert CR = one HyperDX alert named after its metadata.name; its incidents carry the
+label observability.krateo.io/alert=<metadata.name>. The webhook title carries that name.
+Policy A: at most one open incident per alert; a firing on it does firings++, else a new
+<alert>-<yyyymmdd-hhmmss> opens (Analyzing -> RCA -> Open, error set when it has no howToFix).
+Grace: for one spec.interval (5m default) after the latest incident is Resolved (resolution.at),
+a firing counts on that Resolved incident instead; never after Closed.
 
 docs/overview.md: architecture
 docs/usage.md: install + wire the webhook
 docs/configuration.md: image + runtime env
-docs/api.md: the two CRDs + HTTP surface
+docs/api.md: the Alert CRD, the Incident fields written, HTTP surface
+report_v2.py: the RCA output contract; howToFix = {precondition, apply, verify} bash scripts, exit 0 gone / 1 holds / else unknown, all three or none
 docs/examples.md: runnable examples
 docs/release.md: bare-semver build/release
 helm/alert-troubleshooter/: the chart
+Alert.status.okSince: when the alert last turned OK, unset otherwise; display only.
+Alert.status.value: an apiRef alert's last RESTAction number, unset for a where alert; display only.
+Alert.spec.apiRef: a RESTAction ({value: N, items?}) polled every interval via snowplow instead of a HyperDX where; needs config.authnUrl.
+ClusterRole krateo-alert-viewer: get/list/watch on Alerts for portal users (the portal reads with the user's token); shipped with no binding, admins bind it to groups.

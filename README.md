@@ -1,21 +1,25 @@
 # krateo-alert-troubleshooter
 
 ## What is this
-Bridges a **HyperDX alert** to an **Autopilot root-cause analysis**, in the background — no
-browser required. The "auto-troubleshoot on fire" path for the Krateo observability Alerts.
+Turns each firing of a Krateo observability **Alert** into an **Incident** with an
+**incident-agent root-cause analysis**, in the background — no browser required.
 
 ```
-HyperDX alert fires → webhook → krateo-alert-troubleshooter → A2A call to krateo-autopilot
-                                                      → TroubleshootingReport CR (status.report = analysis)
-                                                      → portal Alerts section renders it
+Alert fires (HyperDX webhook, or an apiRef RESTAction) → krateo-alert-troubleshooter
+    → open incident for this Alert?  yes → status.firings++
+                                     no  → new Incident → A2A call to incident-agent
+                                           → status: analysis + howToFix scripts, state Open
 ```
 
 ## What it does
-On `POST /webhook` (a HyperDX alert-fired payload) the handler:
-1. creates a `TroubleshootingReport` CR (`observability.krateo.io/v1alpha1`, phase `Analyzing`),
-2. calls the Autopilot A2A agent (`krateo-autopilot`, JSON-RPC `message/stream`) with an
-   end-to-end troubleshooting prompt,
-3. patches the CR status with the streamed analysis (`phase: Ready`, `report: <markdown>`).
+On a firing (`POST /webhook`, or an apiRef alert the reconciler evaluates) the handler:
+1. counts it on the Alert's open `Incident` (`observability.krateo.io/v1alpha1`) if there is one,
+2. else creates one in state `Analyzing` and calls incident-agent over A2A (JSON-RPC
+   `message/stream`) with the incident's prompt,
+3. writes the analysis and its `howToFix` scripts to the Incident's status, in state `Open`.
+
+The incident controller (incident-controller) runs the scripts from there. See
+[docs/overview.md](docs/overview.md#incidents).
 
 Acks the webhook immediately (202) and analyses in a background thread so HyperDX doesn't time out.
 
@@ -30,7 +34,7 @@ Then point a HyperDX webhook at `http://krateo-alert-troubleshooter.krateo-syste
 and reference it as the `channel.webhookId` on your `Alert` CRs.
 
 ## Config (env)
-- `NAMESPACE` (default `krateo-system`) — where reports are created.
+- `NAMESPACE` (default `krateo-system`) — the namespace of its Alerts and their Incidents.
 - `AUTOPILOT_A2A_URL` (default `http://krateo-autopilot.krateo-system.svc:8080/`).
 - `A2A_TIMEOUT` (default `180`s).
 

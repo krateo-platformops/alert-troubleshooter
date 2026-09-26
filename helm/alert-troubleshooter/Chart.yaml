@@ -1,6 +1,6 @@
 apiVersion: v2
 name: alert-troubleshooter
-description: Bridges a HyperDX observability alert to an incident-agent root-cause analysis, written back as a TroubleshootingReport CR the portal renders.
+description: Turns each firing of an observability Alert into an Incident with an incident-agent root-cause analysis and its how-to-fix scripts.
 type: application
 version: CHART_VERSION
 appVersion: "CHART_VERSION"

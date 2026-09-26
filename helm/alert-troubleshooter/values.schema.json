@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema",
   "title": "Alert Troubleshooter",
-  "description": "Bridges a HyperDX observability alert to an incident-agent root-cause analysis, written back as a TroubleshootingReport CR the portal renders.",
+  "description": "Turns each firing of an observability Alert into an Incident with an incident-agent root-cause analysis and its how-to-fix scripts.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -82,17 +82,17 @@
           "description": "Base URL of the authn service. When set, the handler exchanges its projected ServiceAccount token (audience \"authn\") at `<authnUrl>/serviceaccount/login` for a Krateo JWT and presents it on the A2A call, so incident-agent can reach its agentgateway-gated MCP tools; a `serviceaccount.authn.krateo.io` ServiceAccount mapping CR is also rendered. Requires authn's serviceaccount strategy. Empty (default) disables it — the A2A call is unauthenticated (safe on older clusters with no gateway). Enable in-cluster with `http://authn.krateo-system.svc`.",
           "default": ""
         },
+        "snowplowUrl": {
+          "type": "string",
+          "title": "snowplow URL",
+          "description": "Base URL of snowplow, which resolves an apiRef Alert's RESTAction (`GET <snowplowUrl>/call`) as this service's authn identity, so apiRef alerts also need `authnUrl`. Defaults to the in-cluster snowplow Service.",
+          "default": "http://snowplow.krateo-system.svc:8081"
+        },
         "hyperdxApiUrl": {
           "type": "string",
           "title": "HyperDX API URL",
           "description": "HyperDX v2 external API the reconciler pushes Alert CRs to (Bearer auth). Defaults to the krateo-clickstack-api Service.",
           "default": "http://krateo-clickstack-api.krateo-system.svc:8000"
-        },
-        "reportCooldown": {
-          "type": "integer",
-          "title": "Report cooldown (s)",
-          "description": "Dedup window in seconds: don't re-analyze the same alert within this.",
-          "default": 1800
         },
         "reconcileInterval": {
           "type": "integer",

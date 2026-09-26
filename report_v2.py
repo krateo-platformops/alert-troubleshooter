@@ -1,20 +1,20 @@
-"""TroubleshootingReport v2 — the structured-investigation contract with the Autopilot agent.
+"""The Incident's structured-investigation contract with the RCA agent (incident-agent).
 
 Owns BOTH sides of the contract so they can't drift:
   * STRUCTURED_OUTPUT_INSTRUCTIONS — appended to the RCA prompt; requires the agent to end its
     answer with ONE fenced ```json block matching the v2 status fields.
-  * parse_structured_report(text) — defensively extracts + sanitizes that block into the CR's
-    status fields. NEVER raises: any malformed/missing JSON degrades to a prose-only (v1) report.
+  * parse_structured_report(text) — defensively extracts + sanitizes that block into the
+    Incident's status fields. NEVER raises: any malformed/missing JSON degrades to a prose-only
+    (v1) report.
 
-Sanitizing rules (defensive, latest-run-wins):
+Sanitizing rules (defensive):
   * unknown keys are dropped; wrong-typed values are coerced when safe, else dropped;
   * sources[].type outside the enum falls back to "object" (evidence is kept, never lost);
   * reasoningTrace[].evidenceRefs are validated against len(sources): out-of-bounds/non-int
     indices are dropped (the step is kept — a step may legitimately lose a bad citation);
   * steps are renumbered 1..N in the order given (the agent's order is authoritative);
   * rootCause.confidence normalizes number-or-string to a "0.00"-style decimal string in [0,1];
-  * remediationPlan[].payload must be a JSON object (the CRD preserves unknown fields there);
-    observedOutcome is forced empty — it is filled post-apply by the remediation flow, not here.
+  * howToFix is all three scripts or nothing — see _how_to_fix;
   * confidence is then BOUNDED by the evidence that was actually retrieved — see the evidence
     policy below.
 
@@ -25,13 +25,18 @@ import re
 
 TRIGGERS = ("alert", "composition-condition", "user-ask")
 SOURCE_TYPES = ("logs", "events", "metrics", "object")
-LIFECYCLES = ("open", "mitigated", "resolved")
 
-# Every v2 key the handler writes under .status. The Ready patch always carries ALL of them
-# (parsed value or None→JSON null, which merge-patch DELETES) so a re-run that fails to produce
-# structure also clears the previous run's structure — no stale mixed-run investigation.
+# Every parsed key the handler writes under the Incident's .status. parse_structured_report also
+# returns `evidence` (the retrieval ledger behind the confidence cap), which the Incident does not
+# store: its operator-facing sentence is already in the prose and missingContext.
 V2_STATUS_KEYS = ("analyzedResources", "sources", "missingContext", "assumptions",
-                  "reasoningTrace", "rootCause", "remediationPlan", "evidence")
+                  "reasoningTrace", "rootCause", "howToFix")
+
+# status.howToFix: bash scripts. The incident controller runs precondition and verify in a
+# read-only sandbox (exit 0 = the incident is gone, 1 = it holds, anything else = unknown); a human
+# runs apply.
+HOW_TO_FIX_SCRIPTS = ("precondition", "apply", "verify")
+SCRIPT_MAX_CHARS = 16384
 
 STRUCTURED_OUTPUT_INSTRUCTIONS = """
 
@@ -46,10 +51,7 @@ after it) containing a machine-readable summary of the SAME investigation, with 
   "assumptions": ["what you assumed because of that"],
   "reasoningTrace": [{"step": 1, "statement": "...", "evidenceRefs": [0]}],
   "rootCause": {"statement": "...", "confidence": 0.85, "category": "config|capacity|image|network|dependency|other"},
-  "remediationPlan": [
-    {"description": "Increase memory limit for payments-api", "verb": "patch", "gvr": "apps/v1/deployments", "target": {"name": "payments-api", "namespace": "payments"}, "payload": {"spec":{"template":{"spec":{"containers":[{"name":"payments-api","image":"ghcr.io/example/payments-api:1.2.3","resources":{"limits":{"memory":"512Mi"},"requests":{"memory":"128Mi"}}}]}}}}, "successCriterion": "Deployment payments-api reports 1/1 ready replicas with no OOMKilled events", "verifyCommand": "kubectl get deployment payments-api -n payments", "sourceRef": 0},
-    {"description": "Add service exclusions to alert query", "verb": "patch", "gvr": "observability.krateo.io/v1alpha1/alerts", "target": {"name": "krateo-alert-composition-reconcile-error", "namespace": "krateo-system"}, "payload": {"spec":{"where":"Body:ReconcileError AND NOT ServiceName:krateo-observability AND NOT ServiceName:krateo-alert-troubleshooter AND NOT ServiceName:krateo-clickstack-clickhouse AND NOT ServiceName:krateo-clickstack AND NOT ServiceName:krateo-clickstack-clickhouse-clickhouse AND NOT ServiceName:clickhouse-mcp-server"}}, "successCriterion": "Alert krateo-alert-composition-reconcile-error transitions to OK state", "verifyCommand": "kubectl get alert krateo-alert-composition-reconcile-error -n krateo-system -o jsonpath='{.status.state}'", "sourceRef": 1}
-  ]
+  "howToFix": {"precondition": "<bash script>", "apply": "<bash script>", "verify": "<bash script>"}
 }
 
 Hard rules for this block:
@@ -78,50 +80,114 @@ Hard rules for this block:
 - Do NOT state a numeric confidence anywhere in the markdown prose — only in this JSON block. The
   published confidence may be bounded down by the retrieval ledger, and a percentage left in the
   prose would then contradict the report's own status.
-- remediationPlan is a PLAN only — it will not be executed automatically; order the steps, and
-  make each successCriterion independently checkable. Leave observed outcomes out; they are
-  recorded later.
-- BE ACTIONABLE: when the evidence identifies a safe corrective write (adjust a limit, fix an
-  image tag, patch an Alert query, delete a stuck object), emit AT LEAST ONE step whose verb is
-  patch/apply/delete with a concrete payload — not a plan made only of "get" verification steps.
-  A remediationPlan that is ENTIRELY "get" steps when a real fix is identifiable is a MISS: an
-  operator can't apply a `get`. Only fall back to get-only when you genuinely cannot determine a
-  safe write from the evidence (say why in missingContext). Keep every existing safety rail — in
-  particular NEVER emit patch/apply/delete for v1/nodes or other cluster-scoped kinds.
-- MARK VERIFICATION-ONLY STEPS: a step that merely CHECKS state (verb "get") must say so in its
-  description (e.g. prefix "Verify: ...") so it is never mistaken for the corrective action. Put
-  the actual corrective write(s) first; list any get-only confirmation steps after them.
-- remediationPlan[].description MUST be a SHORT imperative phrase, ≤60 chars, no trailing period
-  (e.g. "Restart payments-api deployment", "Provision payments-db database"). Do NOT put constraints,
-  namespaces, ports, or labels in description — those belong in successCriterion. Never repeat
-  the description text inside successCriterion.
-- remediationPlan[].verifyCommand MUST be a single kubectl command (no shell pipes, no &&) that
-  lets an operator check the successCriterion (e.g. "kubectl get endpoints payments-db -n payments").
-  Omit if no single kubectl command captures the check.
-- remediationPlan[].sourceRef MUST be the 0-based index into "sources" of the evidence that best
-  explains WHY this step is needed. Required for every step — pick the closest match if none is
-  perfect.
-- CLUSTER-SCOPED RESOURCES (v1/nodes, v1/namespaces, …): the portal write path requires a
-  namespace query parameter that cluster-scoped resources don't have. Use verb "get" ONLY for
-  nodes and other cluster-scoped kinds. Never emit verb "patch"/"apply"/"delete" for v1/nodes.
-- DEPLOYMENT CONTAINER PATCHES: a merge-patch on spec.template.spec.containers[] MUST include
-  both "name" and "image" in the payload's container entry to identify which container to update.
-  Omitting "image" causes a 422 Invalid. Fetch the current image with k8s_get_resources first,
-  then include it verbatim: {"spec":{"template":{"spec":{"containers":[{"name":"X","image":"<current>","resources":{…}}]}}}}.
-- ALERT QUERY FALSE-POSITIVES: when the root cause is a self-referential telemetry feedback loop
-  (the alert evaluator/ClickHouse/troubleshooter logs the SQL query into the log store, and those
-  log lines match the alert's own where clause), the fix is to patch the Alert CR's spec.where to
-  add NOT ServiceName: exclusions for the observability stack. Use gvr
-  "observability.krateo.io/v1alpha1/alerts", verb "patch", and payload
-  {"spec":{"where":"<original query> AND NOT ServiceName:krateo-observability AND NOT
-  ServiceName:krateo-alert-troubleshooter AND NOT ServiceName:krateo-clickstack-clickhouse AND NOT
-  ServiceName:krateo-clickstack AND NOT ServiceName:krateo-clickstack-clickhouse-clickhouse AND NOT
-  ServiceName:clickhouse-mcp-server"}}. Never target a Deployment or Composition for an alert
-  query fix — the alert rule lives in the Alert CR.
-- VERIFY WORKLOAD EXISTS before building a remediationPlan step targeting it. If a workload (pod,
-  deployment, namespace) is missing or not found when you query k8s_get_resources, do NOT produce
-  a remediationPlan step to create or provision it — report it in missingContext instead.
-- Output STRICT JSON (double quotes, no comments, no trailing commas)."""
+
+HOW TO FIX. "howToFix" is the fix as three bash scripts, each ONE JSON string (newlines as \\n,
+double quotes and backslashes escaped). A controller runs precondition and verify and moves the
+incident on their exit codes; a human reviews apply and runs it. Nothing else runs automatically.
+- EXIT CODES, precondition and verify alike: 0 = the incident is gone, 1 = it still holds,
+  anything else or a timeout = unknown, which changes nothing. Exit 2 whenever the script cannot
+  tell.
+- PRECONDITION asks "does the incident still hold?". It first runs right after your analysis and
+  MUST exit 1 then: a 0 on that first run flags the incident as not reproduced. Build its test from
+  the values you read this run, so it holds against the state you saw.
+- TEST THE ROOT-CAUSE OBJECT, NEVER THE ALERT'S SIGNAL. Read the one object rootCause names, by
+  kind, name and namespace, and test the field that is wrong on it. Never re-run the alert's query,
+  count its rows or re-evaluate everything it matched: the alert can keep firing for a second
+  reason, and the check must still tell whether THIS cause is gone. Test current state (spec,
+  status, existence), not logs or Events: those describe the past and expire, and a check built on
+  them reports "gone" when they do.
+- VERIFY asks "did the fix work?": the root cause is gone and what it broke is healthy again. Test
+  that outcome, not the literal change apply makes, since a human may fix it another way. It runs
+  after the precondition exits 0 or a human marks apply done, and is retried for a settle window of
+  about five minutes, so read once; do not wait or poll.
+- THE SANDBOX. Precondition and verify run in a pod with only bash, kubectl and jq, as a
+  ServiceAccount that can get and list but never write, and cannot read Secrets. Its network
+  reaches only the Kubernetes API server, and it is killed after 60 seconds. So a check uses bash
+  builtins, read-only kubectl and jq, and nothing else (no grep, sed, awk or curl; no ClickHouse,
+  HyperDX or snowplow), and finishes in seconds. kubectl already reaches the right cluster and the
+  controller enforces the deadline: pass no --server, --kubeconfig, --context or --request-timeout.
+  When the root-cause object is a Secret, test the object whose state shows it (the workload that
+  mounts it) and say so in assumptions.
+- A FAILED READ IS UNKNOWN, NEVER A VERDICT. kubectl exits 1 on any error (Forbidden, NotFound,
+  timeout), and 1 means "still holds". So no `set -e` in a check; end every read with `|| exit 2`;
+  map a `jq -e` test explicitly (0 = true, 1 = false, any other code is an error, so exit 2). When
+  absence IS the answer, read with `--ignore-not-found` and decide what empty output means.
+- Status can describe the previous spec: when a kind reports status.observedGeneration, trust its
+  status only once that reaches metadata.generation.
+- Name a custom resource by resource.group (alerts.observability.krateo.io): short names collide
+  across API groups.
+- APPLY is the corrective write, reviewed and run by a human with bash, kubectl and jq. It is
+  readable (a comment saying what it changes and why) and idempotent: a second run changes nothing.
+  It may `set -euo pipefail`. Prefer kubectl's own verbs (set image, set resources, scale) to
+  hand-written patches. A `--type merge` patch replaces every list it touches, so never merge-patch
+  a list such as containers; built-in kinds take kubectl's default strategic patch, which merges
+  containers by name.
+- BE ACTIONABLE: when the evidence identifies a safe corrective write (adjust a limit, fix an image
+  tag, narrow an Alert's where, delete a stuck object), apply makes it; an apply that only reads is
+  a MISS. Only when you genuinely cannot determine a safe write does apply hold comments alone,
+  saying what a human must decide, with the reason in missingContext.
+- VERIFY IT EXISTS: every object a script names is one you read this run. If a workload you would
+  fix is missing, do not create or provision it in apply; report it in missingContext.
+- apply never deletes a Namespace, a Node or a CustomResourceDefinition: each takes everything
+  under it along.
+- Every script starts with `#!/usr/bin/env bash` and a comment line saying what it tests or changes.
+
+Example: payments-api is OOMKilled at a 128Mi memory limit.
+  precondition:
+    #!/usr/bin/env bash
+    # Holds while payments-api still has the 128Mi memory limit it was OOMKilled at.
+    d=$(kubectl get deployment payments-api -n payments -o json) || exit 2
+    jq -e '.spec.template.spec.containers[] | select(.name == "payments-api")
+      | .resources.limits.memory == "128Mi"' <<<"$d" >/dev/null
+    case $? in 0) exit 1 ;; 1) exit 0 ;; *) exit 2 ;; esac
+  apply:
+    #!/usr/bin/env bash
+    # Raise payments-api's memory limit from 128Mi, where it was OOMKilled, to 512Mi.
+    set -euo pipefail
+    kubectl set resources deployment payments-api -n payments -c payments-api --limits=memory=512Mi
+  verify:
+    #!/usr/bin/env bash
+    # Fixed once payments-api is off the 128Mi limit and every replica runs the new spec.
+    d=$(kubectl get deployment payments-api -n payments -o json) || exit 2
+    jq -e '(.spec.template.spec.containers[] | select(.name == "payments-api")
+        | .resources.limits.memory != "128Mi")
+      and .status.observedGeneration >= .metadata.generation
+      and .status.updatedReplicas == .spec.replicas
+      and .status.availableReplicas == .spec.replicas' <<<"$d" >/dev/null
+    case $? in 0) exit 0 ;; 1) exit 1 ;; *) exit 2 ;; esac
+
+ALERT QUERY FALSE-POSITIVES: when the rows an Alert counts are written by the telemetry pipeline
+itself (a component that evaluates, stores or analyzes the alert logs text matching the alert's
+own where), the root-cause object is the Alert, not a workload. The fix narrows its spec.where
+(ClickHouse SQL) to exclude the services those rows name. Take the names from the rows you read,
+never from memory, and never target a Deployment or Composition for it: the rule lives in the
+Alert. With <alert>, <namespace>, <svc-a> and <svc-b> filled in:
+  precondition:
+    #!/usr/bin/env bash
+    # Holds while <alert>'s where does not exclude <svc-a> and <svc-b>.
+    w=$(kubectl get alerts.observability.krateo.io <alert> -n <namespace> -o jsonpath='{.spec.where}') || exit 2
+    for s in <svc-a> <svc-b>; do
+      [[ $w == *"'$s'"* ]] || exit 1
+    done
+    exit 0
+  apply:
+    #!/usr/bin/env bash
+    # Exclude <svc-a> and <svc-b>, whose logs echo this alert's own query, from its where.
+    set -euo pipefail
+    x="ServiceName NOT IN ('<svc-a>', '<svc-b>')"
+    w=$(kubectl get alerts.observability.krateo.io <alert> -n <namespace> -o jsonpath='{.spec.where}')
+    case "$w" in *"$x"*) exit 0 ;; esac
+    kubectl patch alerts.observability.krateo.io <alert> -n <namespace> --type merge \\
+      -p "$(jq -n --arg w "($w) AND $x" '{spec: {where: $w}}')"
+  verify:
+    #!/usr/bin/env bash
+    # Fixed once the where excludes both services and the reconciler has pushed it (phase Synced).
+    o=$(kubectl get alerts.observability.krateo.io <alert> -n <namespace> -o json) || exit 2
+    jq -e --arg a "'<svc-a>'" --arg b "'<svc-b>'" \\
+      '(.spec.where // "" | contains($a) and contains($b)) and .status.phase == "Synced"' <<<"$o" >/dev/null
+    case $? in 0) exit 0 ;; 1) exit 1 ;; *) exit 2 ;; esac
+
+Output STRICT JSON (double quotes, no comments, no trailing commas)."""
 
 # Fence LINES (```lang or bare ```), walked as sequential open/close PAIRS. A single
 # pairing regex mis-pairs when a non-json block precedes (a ```yaml example's CLOSING
@@ -254,30 +320,41 @@ def _root_cause(v):
     return o
 
 
-def _plan(v):
-    out = []
-    if not isinstance(v, list):
-        return out
-    for x in v[:32]:
-        o = _obj(x, ("description", "verb", "gvr", "successCriterion", "verifyCommand"))
-        if not o or "description" not in o:
-            continue
-        target = _obj(x.get("target"), ("name", "namespace"))
-        if target:
-            o["target"] = target
-        payload = x.get("payload")
-        if isinstance(payload, dict) and payload:
-            o["payload"] = payload  # CRD: object + x-kubernetes-preserve-unknown-fields
-        sr = x.get("sourceRef")
-        if isinstance(sr, bool):
-            sr = None
-        elif isinstance(sr, float) and sr.is_integer():
-            sr = int(sr)
-        if isinstance(sr, int) and sr >= 0:
-            o["sourceRef"] = sr
-        o["observedOutcome"] = ""  # filled post-apply by the remediation flow, never here
-        out.append(o)
-    return out
+def _script(v):
+    """(script, None), or (None, why it is unusable). A list of lines is joined. A script over
+    SCRIPT_MAX_CHARS is rejected, never truncated: a cut script is a different script."""
+    if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+        v = "\n".join(v)
+    if not isinstance(v, str) or not v.strip():
+        return None, "missing"
+    v = v.strip()
+    if len(v) > SCRIPT_MAX_CHARS:
+        return None, f"over {SCRIPT_MAX_CHARS} characters"
+    return v + "\n", None
+
+
+def _how_to_fix(v):
+    """(howToFix, problems). howToFix holds all three scripts or is None: the controller needs
+    precondition and verify to move the incident, and the human needs apply, so a partial set is
+    dropped whole and the rest of the report is kept. Keys other than the three are dropped."""
+    if v is None:
+        return None, ["none returned"]
+    if not isinstance(v, dict):
+        return None, ["not an object"]
+    out, problems = {}, []
+    for k in HOW_TO_FIX_SCRIPTS:
+        script, why = _script(v.get(k))
+        if why:
+            problems.append(f"{k} {why}")
+        else:
+            out[k] = script
+    return (None, problems) if problems else (out, [])
+
+
+def _no_fix_note(problems):
+    """The missingContext line for a report whose howToFix was dropped."""
+    return (f"No usable howToFix ({'; '.join(problems)}): the incident has no scripts to check or "
+            "fix it.")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -584,7 +661,7 @@ def _candidate_blocks(text):
             data = json.loads(span.body)
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(data, dict) and any(k in data for k in V2_STATUS_KEYS + ("rootCause",)):
+        if isinstance(data, dict) and any(k in data for k in V2_STATUS_KEYS):
             yield span, data
 
 
@@ -602,6 +679,7 @@ def parse_structured_report(text, tool_ledger=None):
     try:
         for match, data in _candidate_blocks(text):
             sources = _sources(data.get("sources"))
+            how_to_fix, fix_problems = _how_to_fix(data.get("howToFix"))
             v2 = {
                 "analyzedResources": _obj_list(data.get("analyzedResources"),
                                                ("gvr", "name", "namespace", "whatWasRead")),
@@ -610,7 +688,7 @@ def parse_structured_report(text, tool_ledger=None):
                 "assumptions": _str_list(data.get("assumptions")),
                 "reasoningTrace": _trace(data.get("reasoningTrace"), len(sources)),
                 "rootCause": _root_cause(data.get("rootCause")),
-                "remediationPlan": _plan(data.get("remediationPlan")),
+                "howToFix": how_to_fix,
             }
             if not any(v2.values()):
                 continue  # a JSON block with the right keys but no usable content → keep looking
@@ -629,9 +707,14 @@ def parse_structured_report(text, tool_ledger=None):
                 prose, v2 = apply_evidence_policy(prose, v2, ledger)
             except Exception:  # noqa: BLE001 — never let the cap break the report it annotates
                 pass
+            # A root cause without usable scripts leaves the incident with nothing to check; the
+            # gaps list is what the operator reads, so say why there.
+            if fix_problems and v2.get("rootCause"):
+                v2["missingContext"] = (v2.get("missingContext") or [])[:63] + \
+                    [_no_fix_note(fix_problems)]
             return prose, v2
     except Exception:  # noqa: BLE001 — the structured block is best-effort, never fatal
         pass
-    # FALLBACK STAYS BYTE-IDENTICAL. handler.py keep-last-good keys off `not prose and not v2`;
-    # a banner here would make an empty A2A reply look like a result and overwrite a good report.
+    # FALLBACK STAYS BYTE-IDENTICAL. handler.run_analysis tells an empty answer by `not prose and
+    # not v2`; a banner here would make an empty A2A reply look like a result.
     return text, {}
