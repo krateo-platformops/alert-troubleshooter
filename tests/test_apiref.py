@@ -133,6 +133,7 @@ class TestReconcileApiRef(unittest.TestCase):
         kw = self.started[0]
         self.assertEqual(kw["alert_ref"], "cd-not-ready")
         self.assertEqual(kw["alert_state"], "ALERT")
+        self.assertEqual(kw["interval"], "5m")                # the Resolved grace window
         self.assertEqual(kw["api"], {**REF, "value": 2, "threshold": 1, "thresholdType": "above",
                                      "items": ["fireworksapp"]})
 

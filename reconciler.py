@@ -375,7 +375,7 @@ def _reconcile_apiref(cr):
     if st == "ALERT":
         _start_analysis(alert_name=display, alert_state=st, alert_ref=name,
                         alert_namespace=meta.get("namespace") or NAMESPACE,
-                        message=spec.get("message"),
+                        message=spec.get("message"), interval=spec.get("interval"),
                         api={"name": ref.get("name"), "namespace": ref.get("namespace"),
                              "value": value, "threshold": threshold, "thresholdType": kind,
                              "items": out.get("items")})

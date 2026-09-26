@@ -38,6 +38,15 @@ LABEL_ALERT = "observability.krateo.io/alert"  # value: the Alert's metadata.nam
 ENDED = ("Resolved", "Closed")                 # an incident in any other state is open
 WRITE_ATTEMPTS = 5                             # conditioned status writes retried on a 409
 
+# Alert spec.interval: a `where` alert's lookback window, an apiRef alert's polling period.
+INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
+                    "6h": 21600, "12h": 43200, "1d": 86400}
+
+
+def interval_seconds(interval):
+    """spec.interval in seconds; 5m when unset or unknown."""
+    return INTERVAL_SECONDS.get(interval, 300)
+
 # Intra-service auth (Option A). The alert->RCA pipeline is autonomous — it carries NO user JWT —
 # but incident-agent's MCP tools sit behind agentgateway, whose authz allows /mcp only with a valid
 # Krateo JWT (`has(jwt.sub)`). So we mint a SERVICE identity: exchange this pod's projected
@@ -126,13 +135,39 @@ def _context_id(name):
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
 
 
-def _open_incident(ns, alert_ref):
-    """The alert's open Incident, the newest if there are several, or None."""
-    selector = quote(f"{LABEL_ALERT}={alert_ref}", safe="")
-    items = _k8s("GET", f"{_incidents(ns)}?labelSelector={selector}").get("items") or []
-    open_ = [i for i in items if (i.get("status") or {}).get("state") not in ENDED]
-    return max(open_, default=None,
+def _newest(items):
+    return max(items, default=None,
                key=lambda i: (i["metadata"].get("creationTimestamp", ""), i["metadata"]["name"]))
+
+
+def _resolved_at(incident):
+    at = ((incident.get("status") or {}).get("resolution") or {}).get("at")
+    try:
+        return datetime.fromisoformat(str(at).replace("Z", "+00:00")) if at else None
+    except ValueError:
+        return None
+
+
+def incident_to_count(items, at, grace):
+    """The incident a firing at `at` counts on, or None to open a new one.
+
+    The newest open incident; else the alert's latest incident when it is Resolved less than
+    `grace` seconds (one spec.interval) ago. A `where` alert keeps counting rows from before the
+    fix for its lookback window, so those firings belong to the incident that fix resolved. A
+    Closed incident never takes a firing: after a human close the next firing opens a new one."""
+    open_ = _newest([i for i in items if (i.get("status") or {}).get("state") not in ENDED])
+    if open_ is not None:
+        return open_
+    latest = _newest(items)
+    if latest is None or (latest.get("status") or {}).get("state") != "Resolved":
+        return None
+    resolved = _resolved_at(latest)
+    return latest if resolved and (at - resolved).total_seconds() < grace else None
+
+
+def _alert_incidents(ns, alert_ref):
+    selector = quote(f"{LABEL_ALERT}={alert_ref}", safe="")
+    return _k8s("GET", f"{_incidents(ns)}?labelSelector={selector}").get("items") or []
 
 
 def _patch_status(ns, incident, status):
@@ -144,7 +179,7 @@ def _patch_status(ns, incident, status):
 
 
 def _count_firing(ns, incident, now):
-    """firings++ and lastFiredAt on an open incident. False on a lost race (409)."""
+    """firings++ and lastFiredAt, and nothing else. False on a lost race (409)."""
     firings = int((incident.get("status") or {}).get("firings") or 0)
     try:
         _patch_status(ns, incident, {"firings": firings + 1, "lastFiredAt": now})
@@ -155,17 +190,18 @@ def _count_firing(ns, incident, now):
         raise
 
 
-def _open_or_count(ns, alert_ref, prompt, at):
-    """Policy A for one firing: count it on the alert's open incident, or create one.
+def _open_or_count(ns, alert_ref, prompt, at, grace):
+    """Policy A for one firing: count it on the incident incident_to_count picks, or create one.
 
-    Returns the new Incident, or None when the firing was counted on an open one."""
+    Returns the new Incident, or None when the firing was counted on an existing one."""
     now = at.isoformat()
     name = incident_name(alert_ref, at)
     for _ in range(WRITE_ATTEMPTS):
-        open_ = _open_incident(ns, alert_ref)
-        if open_ is not None:
-            if _count_firing(ns, open_, now):
-                print(f"[incident] {ns}/{open_['metadata']['name']}: firing counted", flush=True)
+        target = incident_to_count(_alert_incidents(ns, alert_ref), at, grace)
+        if target is not None:
+            if _count_firing(ns, target, now):
+                print(f"[incident] {ns}/{target['metadata']['name']}: firing counted "
+                      f"({(target.get('status') or {}).get('state') or 'new'})", flush=True)
                 return None
             continue
         body = {"apiVersion": f"{GROUP}/{VERSION}", "kind": "Incident",
@@ -420,17 +456,18 @@ def process(payload):
     alert_ref = m_meta.get("name", "")                        # exact key → /alerts/{ns}/{name}
     alert_namespace = m_meta.get("namespace") or alert_ns     # the Alert CR's real namespace
     analyze(m_spec.get("displayName") or alert_ref, alert_state, alert_ref, alert_namespace,
-            where=where, message=message)
+            where=where, message=message, interval=m_spec.get("interval"))
 
 
 def analyze(alert_name, alert_state, alert_ref, alert_namespace, where=None, message=None,
-            api=None):
+            api=None, interval=None):
     """One firing of an alert, through Policy A.
 
     Both triggers call it: the HyperDX webhook (process) and the evaluation of an apiRef alert
     (reconciler), which passes `api` = {name, namespace, value, threshold, thresholdType, items}.
-    `alert_name` is the displayName, `alert_ref` the Alert's metadata.name; the incident lives in
-    the Alert's namespace. A firing on an open incident is counted on it and runs no RCA.
+    `alert_name` is the displayName, `alert_ref` the Alert's metadata.name, `interval` its
+    spec.interval; the incident lives in the Alert's namespace. A firing on an open incident, or
+    within one interval of the latest one's resolution, is counted on it and runs no RCA.
     """
     if len(alert_ref) > 63:
         print(f"[incident] alert {alert_ref!r}: a name over 63 characters cannot label an "
@@ -440,7 +477,8 @@ def analyze(alert_name, alert_state, alert_ref, alert_namespace, where=None, mes
     prompt = build_prompt(alert_name, alert_state, where, message, api=api)
     try:
         with _create_lock:
-            created = _open_or_count(ns, alert_ref, prompt, datetime.now(timezone.utc))
+            created = _open_or_count(ns, alert_ref, prompt, datetime.now(timezone.utc),
+                                     interval_seconds(interval))
     except Exception as e:  # noqa: BLE001 — a failed write loses this firing, not the next one
         print(f"[err] alert {ns}/{alert_ref}: firing not recorded ({e})", flush=True)
         return

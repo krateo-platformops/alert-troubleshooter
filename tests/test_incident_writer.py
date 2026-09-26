@@ -8,7 +8,7 @@ import os
 import sys
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -30,10 +30,15 @@ def answer(block=BLOCK, prose="## Root cause\nchart 1.1.9 is missing"):
     return f"{prose}\n\n```json\n{json.dumps(block)}\n```"
 
 
-def alert_cr(name=ALERT, where="Body LIKE '%x%'"):
-    return {"metadata": {"name": name, "namespace": NS},
-            "spec": {"displayName": "CompositionDefinition not ready", "where": where},
-            "status": {"state": "ALERT"}}
+def alert_cr(name=ALERT, where="Body LIKE '%x%'", interval=None):
+    spec = {"displayName": "CompositionDefinition not ready", "where": where}
+    if interval:
+        spec["interval"] = interval
+    return {"metadata": {"name": name, "namespace": NS}, "spec": spec, "status": {"state": "ALERT"}}
+
+
+def ago(seconds):
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class WriterCase(unittest.TestCase):
@@ -126,6 +131,8 @@ class TestPolicyA(WriterCase):
 
     def test_an_ended_incident_does_not_count_a_new_firing_opens_one(self):
         self.k8s.put(NS, f"{ALERT}-resolved", ALERT, state="Resolved")
+        self.k8s.write_status(NS, f"{ALERT}-resolved",
+                              {"resolution": {"by": "verify", "at": ago(3600)}})  # past the window
         self.k8s.put(NS, f"{ALERT}-closed", ALERT, state="Closed")
         self.fire()
         self.assertEqual(len(self.k8s.incidents), 3)
@@ -176,6 +183,89 @@ class TestPolicyA(WriterCase):
         handler._k8s = down
         self.fire()                            # does not raise
         self.assertEqual(self.rca, [])
+
+
+class TestResolvedGrace(WriterCase):
+    """For one spec.interval after the alert's latest incident is Resolved, a firing counts on it:
+    a `where` alert keeps counting pre-fix rows for its lookback window."""
+
+    def ended(self, name, state, seconds_ago, created="2026-09-25T10:00:00Z"):
+        self.k8s.put(NS, name, ALERT, state=state, created=created)
+        self.k8s.write_status(NS, name, {"resolution": {"by": "verify" if state == "Resolved"
+                                                        else "user", "at": ago(seconds_ago)}})
+
+    def test_inside_the_window_the_firing_counts_on_the_Resolved_incident(self):
+        self.ended(f"{ALERT}-r", "Resolved", 60)
+        self.fire()
+        st = self.k8s.only()["status"]
+        self.assertEqual((st["state"], st["firings"]), ("Resolved", 2))
+        self.assertIn("lastFiredAt", st)
+        self.assertEqual(self.rca, [])
+
+    def test_outside_the_window_a_new_incident_opens(self):
+        self.ended(f"{ALERT}-r", "Resolved", 600)
+        self.fire()
+        self.assertEqual(len(self.k8s.incidents), 2)
+        self.assertEqual(len(self.rca), 1)
+
+    def test_a_Closed_incident_never_takes_a_firing(self):
+        self.ended(f"{ALERT}-c", "Closed", 10)
+        self.fire()
+        self.assertEqual(len(self.k8s.incidents), 2)
+        self.assertEqual(self.k8s.incidents[(NS, f"{ALERT}-c")]["status"]["firings"], 1)
+
+    def test_only_the_latest_incident_gives_grace(self):
+        """An older Resolved one inside the window does not count once a later one was Closed."""
+        self.ended(f"{ALERT}-r", "Resolved", 30, created="2026-09-25T09:00:00Z")
+        self.ended(f"{ALERT}-c", "Closed", 10, created="2026-09-25T10:00:00Z")
+        self.fire()
+        self.assertEqual(len(self.k8s.incidents), 3)
+
+    def test_an_open_incident_takes_precedence(self):
+        self.k8s.put(NS, f"{ALERT}-o", ALERT, state="Open", created="2026-09-25T09:00:00Z")
+        self.ended(f"{ALERT}-r", "Resolved", 10, created="2026-09-25T10:00:00Z")
+        self.fire()
+        self.assertEqual(self.k8s.incidents[(NS, f"{ALERT}-o")]["status"]["firings"], 2)
+        self.assertEqual(self.k8s.incidents[(NS, f"{ALERT}-r")]["status"]["firings"], 1)
+
+    def test_the_window_is_the_alerts_interval(self):
+        for interval, seconds_ago, counted in (("15m", 600, True), ("1m", 90, False),
+                                               (None, 200, True), ("weird", 400, False)):
+            with self.subTest(interval=interval, seconds_ago=seconds_ago):
+                self.k8s.incidents.clear()
+                self.ended(f"{ALERT}-r", "Resolved", seconds_ago)
+                self.fire(interval=interval)
+                self.assertEqual(len(self.k8s.incidents) == 1, counted)
+
+    def test_the_boundary_is_exclusive(self):
+        resolved = datetime(2026, 9, 25, 14, 0, 0, tzinfo=timezone.utc)
+        inc = {"metadata": {"name": "r", "creationTimestamp": "t"},
+               "status": {"state": "Resolved", "resolution": {"by": "verify",
+                                                              "at": "2026-09-25T14:00:00Z"}}}
+        pick = handler.incident_to_count
+        self.assertIs(pick([inc], resolved + timedelta(seconds=299), 300), inc)
+        self.assertIsNone(pick([inc], resolved + timedelta(seconds=300), 300))
+        for broken in ({}, {"by": "verify"}, {"by": "verify", "at": "not a time"}):
+            inc["status"]["resolution"] = broken
+            self.assertIsNone(pick([inc], resolved, 300))
+
+    def test_a_concurrent_write_on_the_Resolved_incident_is_retried(self):
+        self.ended(f"{ALERT}-r", "Resolved", 60)
+        hits = []
+
+        def controller(ns, name):
+            if not hits:
+                hits.append(name)
+                self.k8s.write_status(ns, name, {"conditions": [{"type": "Ready"}]})
+        self.k8s.before_patch = controller
+        self.fire()
+        self.assertEqual(self.k8s.only()["status"]["firings"], 2)
+
+    def test_the_webhook_passes_the_alerts_interval(self):
+        self.k8s.alerts[ALERT] = alert_cr(interval="15m")
+        self.ended(f"{ALERT}-r", "Resolved", 600)
+        handler.process({"alertName": f"🚨 {ALERT}", "state": "ALERT"})
+        self.assertEqual(self.k8s.only()["status"]["firings"], 2)
 
 
 class TestAnalysisOutcome(WriterCase):

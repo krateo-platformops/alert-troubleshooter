@@ -44,10 +44,15 @@ An alert has at most one open incident (Policy A); an incident is open in any st
 2. if one is open, adds one to its `status.firings`, sets `status.lastFiredAt`, and runs no RCA.
    The incident controller writes the same status, so the write is conditioned on the
    resourceVersion it read and retried on a conflict;
-3. otherwise creates `<alert>-<yyyymmdd-hhmmss>` (the firing's UTC time) with the label and
+3. if none is open but the alert's latest incident is `Resolved` and its `status.resolution.at`
+   is less than one `spec.interval` ago (5m when unset), counts the firing on that incident the
+   same way, and it stays `Resolved`. A `where` alert keeps counting the rows from before the fix
+   for its lookback window, and those firings belong to the incident the fix resolved. A `Closed`
+   incident gets no such window: after a human close, the next firing opens a new one;
+4. otherwise creates `<alert>-<yyyymmdd-hhmmss>` (the firing's UTC time) with the label and
    `spec.alertRef`, `trigger: alert`, `prompt` and `triggeredAt`, in state `Analyzing` with
    `firings: 1`;
-4. runs the RCA on the incident's own kagent thread (contextId = uuid5 of its name), then writes
+5. runs the RCA on the incident's own kagent thread (contextId = uuid5 of its name), then writes
    the analysis, `howToFix` and `state: Open` in one status write.
 
 - An RCA that fails, or whose answer is empty, unstructured or has no usable `howToFix`, still

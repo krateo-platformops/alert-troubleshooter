@@ -16,11 +16,6 @@ import handler
 SNOWPLOW_URL = os.environ.get("SNOWPLOW_URL", "http://snowplow.krateo-system.svc:8081").rstrip("/")
 SNOWPLOW_TIMEOUT = int(os.environ.get("SNOWPLOW_TIMEOUT", "60"))
 
-# spec.interval, which for an apiRef alert is the polling period.
-INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
-                    "6h": 21600, "12h": 43200, "1d": 86400}
-
-
 class ApiRefError(RuntimeError):
     """The RESTAction could not be resolved into a value; the message goes to status.error."""
 
@@ -97,4 +92,4 @@ def due(status, interval, now=None):
     except ValueError:
         return True
     now = now or datetime.now(timezone.utc)
-    return (now - at).total_seconds() >= INTERVAL_SECONDS.get(interval, 300)
+    return (now - at).total_seconds() >= handler.interval_seconds(interval)
